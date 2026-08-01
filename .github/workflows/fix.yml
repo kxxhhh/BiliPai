@@ -199,6 +199,9 @@ jobs:
             --fail-with-body \
             --connect-timeout 20 \
             --max-time 180 \
+            --retry 2 \
+            --retry-delay 5 \
+            --retry-all-errors \
             --request POST "https://toolcode.top/v1/chat/completions" \
             --header "Authorization: Bearer $TOOLCODE_API_KEY" \
             --header "Content-Type: application/json" \
@@ -289,6 +292,9 @@ jobs:
                       --fail-with-body \
                       --connect-timeout 20 \
                       --max-time 180 \
+                      --retry 2 \
+                      --retry-delay 5 \
+                      --retry-all-errors \
                       --request POST "https://toolcode.top/v1/chat/completions" \
                       --header "Authorization: Bearer $TOOLCODE_API_KEY" \
                       --header "Content-Type: application/json" \
@@ -300,25 +306,20 @@ jobs:
 
                     echo "ToolCode source-aware HTTP status: ${RETRY_HTTP_CODE:-unknown}"
                     if [ "$RETRY_CURL_EXIT" -ne 0 ]; then
-                      echo "::error::Source-aware ToolCode request failed with curl exit code $RETRY_CURL_EXIT."
+                      echo "::warning::Source-aware ToolCode request failed with curl exit code $RETRY_CURL_EXIT; keeping the initial response and skipping this fix."
                       cat "$WORK_DIR/ai_source_http_response.json" >&2 || true
-                      exit "$RETRY_CURL_EXIT"
+                    else
+                      if ! jq -e . "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
+                        echo "::warning::Source-aware ToolCode returned invalid JSON; keeping the initial response."
+                        cat "$WORK_DIR/ai_source_http_response.json"
+                      elif ! jq -e '.choices[0].message.content | type == "string"' "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
+                        echo "::warning::Source-aware ToolCode response has no message content; keeping the initial response."
+                        cat "$WORK_DIR/ai_source_http_response.json"
+                      else
+                        jq -r '.choices[0].message.content' "$WORK_DIR/ai_source_http_response.json" > "$WORK_DIR/ai_raw_source_response.txt"
+                        normalize_ai_response "$WORK_DIR/ai_raw_source_response.txt" "$WORK_DIR/ai_response.json"
+                      fi
                     fi
-
-                    if ! jq -e . "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
-                      echo "::error::Source-aware ToolCode returned invalid JSON."
-                      cat "$WORK_DIR/ai_source_http_response.json"
-                      exit 1
-                    fi
-
-                    if ! jq -e '.choices[0].message.content | type == "string"' "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
-                      echo "::error::Source-aware ToolCode response does not contain choices[0].message.content."
-                      cat "$WORK_DIR/ai_source_http_response.json"
-                      exit 1
-                    fi
-
-                    jq -r '.choices[0].message.content' "$WORK_DIR/ai_source_http_response.json" > "$WORK_DIR/ai_raw_source_response.txt"
-                    normalize_ai_response "$WORK_DIR/ai_raw_source_response.txt" "$WORK_DIR/ai_response.json"
                   fi
                   ;;
               esac
