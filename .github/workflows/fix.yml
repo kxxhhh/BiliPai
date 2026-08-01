@@ -136,12 +136,11 @@ jobs:
           : "${TOOLCODE_API_KEY:?TOOLCODE_API_KEY secret is not configured}"
           test -s "$WORK_DIR/build_error.log"
 
-          ERROR_LOG="$(< "$WORK_DIR/build_error.log")"
-          TRACKED_FILES="$(git ls-files)"
+          git ls-files > "$WORK_DIR/tracked_files.txt"
           jq -n \
             --arg model "gpt-5.6-luna" \
-            --arg error_log "$ERROR_LOG" \
-            --arg tracked_files "$TRACKED_FILES" \
+            --rawfile error_log "$WORK_DIR/build_error.log" \
+            --rawfile tracked_files "$WORK_DIR/tracked_files.txt" \
             '{
               model: $model,
               messages: [{
