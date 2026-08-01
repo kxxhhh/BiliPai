@@ -9,10 +9,13 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ViewGroup.LayoutParams
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
@@ -20,6 +23,9 @@ import android.view.ViewTreeObserver
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.PopupWindow
+import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -130,7 +136,8 @@ private class CompanionBoundarySensor(private val density: Float) {
 
 internal class BiliCompanionOverlayView(
     context: Context,
-    private val onVideoClick: (String) -> Unit
+    private val onVideoClick: (String) -> Unit,
+    private val onAssistantAction: ((BiliCompanionAssistantAction) -> Unit)? = null
 ) : View(context) {
     private val accessibilityManager = context.getSystemService(AccessibilityManager::class.java)
     private val boundarySensor = CompanionBoundarySensor(context.resources.displayMetrics.density)
@@ -175,6 +182,7 @@ internal class BiliCompanionOverlayView(
     private var interactiveGesture = false
     private var scaleInProgress = false
     private var fingerFollowActive = false
+    private var assistantPopup: PopupWindow? = null
     private var dragOffsetX = 0f
     private var dragOffsetY = 0f
     private val random = Random(0xB1C0_2026)
@@ -197,11 +205,12 @@ internal class BiliCompanionOverlayView(
         override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
             val bvid = state.speechBvid
             if (bvid != null && pointInBubble(event.x, event.y)) {
-                performClick()
+                announceForAccessibility("正在打开关注的UP主更新")
                 BiliCompanionRuntime.clearSpeech()
                 onVideoClick(bvid)
             } else {
                 performClick()
+                showAssistantMenu()
             }
             return true
         }
@@ -242,6 +251,8 @@ internal class BiliCompanionOverlayView(
 
     override fun onDetachedFromWindow() {
         spriteHandler.removeCallbacks(updateFrameRunnable)
+        assistantPopup?.dismiss()
+        assistantPopup = null
         unbindBoundaryRoot()
         super.onDetachedFromWindow()
     }
@@ -255,6 +266,11 @@ internal class BiliCompanionOverlayView(
 
     fun setHostVisible(value: Boolean) {
         hostVisible = value
+        if (value) {
+            BiliCompanionRuntime.beginWatchSession()
+        } else {
+            BiliCompanionRuntime.endWatchSession()
+        }
         visibility = if (value && enabled && state.overlayEnabled) VISIBLE else INVISIBLE
         if (value) lastFrameNanos = 0L
         invalidate()
@@ -321,6 +337,8 @@ internal class BiliCompanionOverlayView(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!enabled || !hostVisible || width <= 0 || height <= 0) return
+
+        BiliCompanionRuntime.noteWatchTick()
 
         val now = System.nanoTime()
         val deltaSeconds = if (lastFrameNanos == 0L) {
@@ -398,7 +416,7 @@ internal class BiliCompanionOverlayView(
             BiliCompanionRuntime.setCompact(false)
             announceForAccessibility("电子桌宠已展开")
         } else {
-            announceForAccessibility(state.speech)
+            announceForAccessibility(BiliCompanionRuntime.onPetTapped())
         }
         return true
     }
@@ -504,6 +522,7 @@ internal class BiliCompanionOverlayView(
         }
 
         drawSprite(canvas, size, top, resolveSpriteMotion())
+        drawReactionEffect(canvas, top, size)
         if (boundarySensor.loadingDetected && !state.isCompact) drawBroom(canvas, left, top, size)
         if (!state.isCompact) drawFullness(canvas, left, top, size)
     }
@@ -674,10 +693,38 @@ internal class BiliCompanionOverlayView(
     private fun drawFullness(canvas: Canvas, left: Float, top: Float, size: Float) {
         val y = top + size + metrics.density * 5f
         paint.style = Paint.Style.FILL
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textSize = 9f * metrics.density
+        paint.color = 0xD9FFFFFF.toInt()
+        val level = state.experience / 100 + 1
+        canvas.drawText("等级$level · 好感 ${state.affinity}", left + size * 0.1f, y - 4f * metrics.density, paint)
+        paint.style = Paint.Style.FILL
         paint.color = 0x3DFFFFFF
         canvas.drawRoundRect(left + size * 0.1f, y, left + size * 0.9f, y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
         paint.color = 0xFFFFC857.toInt()
         canvas.drawRoundRect(left + size * 0.1f, y, left + size * (0.1f + 0.8f * state.fullness), y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
+        if (state.danmakuCombo >= 3) {
+            paint.textSize = 9f * metrics.density
+            paint.color = 0xFFFFD166.toInt()
+            canvas.drawText("弹幕连击 x${state.danmakuCombo}", left + size * 0.1f, y + 17f * metrics.density, paint)
+        }
+    }
+
+    private fun drawReactionEffect(canvas: Canvas, top: Float, size: Float) {
+        val text = state.reactionText ?: return
+        val ageMs = System.currentTimeMillis() - state.reactionStartedAtMs
+        if (ageMs !in 0..1_500L) return
+
+        val progress = (ageMs / 1_500f).coerceIn(0f, 1f)
+        paint.style = Paint.Style.FILL
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textSize = 13f * metrics.density
+        paint.color = 0xFFFFD166.toInt()
+        paint.alpha = ((1f - progress) * 255f).roundToInt().coerceIn(0, 255)
+        val x = centerX - paint.measureText(text) / 2f
+        val y = top - size * (0.08f + progress * 0.3f)
+        canvas.drawText(text, x, y, paint)
+        paint.alpha = 255
     }
 
     private fun drawBroom(canvas: Canvas, left: Float, top: Float, size: Float) {
@@ -690,6 +737,111 @@ internal class BiliCompanionOverlayView(
         paint.color = 0xFFE7B65C.toInt()
         canvas.drawLine(left + size * 0.28f + sweep, top + size * 1.08f, left + size * 0.68f + sweep, top + size * 1.08f, paint)
         paint.strokeCap = Paint.Cap.BUTT
+    }
+
+    private fun showAssistantMenu() {
+        if (onAssistantAction == null || assistantPopup?.isShowing == true) return
+
+        val density = metrics.density
+        val container = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                (8f * density).roundToInt(),
+                (8f * density).roundToInt(),
+                (8f * density).roundToInt(),
+                (8f * density).roundToInt()
+            )
+            background = GradientDrawable().apply {
+                setColor(0xF7FFFFFF.toInt())
+                cornerRadius = 14f * density
+            }
+        }
+        val title = TextView(context).apply {
+            text = "桌宠助手"
+            setTextColor(0xFF263238.toInt())
+            textSize = 14f
+            setPadding((10f * density).roundToInt(), (4f * density).roundToInt(), 0, (6f * density).roundToInt())
+        }
+        container.addView(
+            title,
+            LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+        )
+        val actions = listOf(
+            "翻译当前标题" to BiliCompanionAssistantAction.TRANSLATE_TITLE,
+            "总结当前视频资料" to BiliCompanionAssistantAction.SUMMARIZE_VIDEO,
+            "查找热门评论" to BiliCompanionAssistantAction.FIND_COMMENTS,
+            "自动翻一页" to BiliCompanionAssistantAction.AUTO_PAGE
+        )
+        actions.forEach { (label, action) ->
+            val item = TextView(context).apply {
+                text = label
+                setTextColor(0xFF37474F.toInt())
+                textSize = 13f
+                gravity = Gravity.CENTER_VERTICAL
+                isClickable = true
+                setPadding(
+                    (12f * density).roundToInt(),
+                    (10f * density).roundToInt(),
+                    (12f * density).roundToInt(),
+                    (10f * density).roundToInt()
+                )
+                setOnClickListener {
+                    assistantPopup?.dismiss()
+                    if (action == BiliCompanionAssistantAction.AUTO_PAGE) {
+                        if (scrollOnePage()) {
+                            BiliCompanionRuntime.showAssistantMessage("已帮你翻到下一页", "翻页完成")
+                        } else {
+                            BiliCompanionRuntime.showAssistantMessage("这一页没有可继续的内容", "翻页提示")
+                        }
+                    } else {
+                        onAssistantAction.invoke(action)
+                    }
+                }
+            }
+            container.addView(
+                item,
+                LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+            )
+        }
+
+        val popup = PopupWindow(
+            container,
+            (196f * density).roundToInt(),
+            LayoutParams.WRAP_CONTENT,
+            true
+        ).apply {
+            setBackgroundDrawable(GradientDrawable().apply { setColor(0xF7FFFFFF.toInt()) })
+            isOutsideTouchable = true
+            elevation = 10f * density
+            setOnDismissListener { assistantPopup = null }
+        }
+        assistantPopup = popup
+        val x = (centerX - 98f * density).roundToInt().coerceIn(8, (width - 204f * density).roundToInt().coerceAtLeast(8))
+        val y = (centerY - currentPetSize() / 2f - 220f * density).roundToInt().coerceAtLeast(8)
+        popup.showAtLocation(this, Gravity.TOP or Gravity.START, x, y)
+    }
+
+    private fun scrollOnePage(): Boolean {
+        val root = rootForBoundary ?: return false
+        val target = findScrollable(root)
+        if (target == null) {
+            return root.performAccessibilityAction(
+                android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                null
+            )
+        }
+        target.scrollBy(0, (height * 0.78f).roundToInt().coerceAtLeast(1))
+        return true
+    }
+
+    private fun findScrollable(view: View): View? {
+        if (view !== this && view.canScrollVertically(1)) return view
+        if (view is ViewGroup) {
+            for (index in view.childCount - 1 downTo 0) {
+                findScrollable(view.getChildAt(index))?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun pointInInteractiveRegion(eventX: Float, eventY: Float): Boolean {
@@ -729,7 +881,8 @@ internal class BiliCompanionOverlayView(
     }
 
     private fun updateAccessibilityDescription() {
-        contentDescription = "Bili-Companion电子桌宠，${resolveMoodLabel(state.mood)}，${state.speech}"
+        val level = state.experience / 100 + 1
+        contentDescription = "Bili-Companion电子桌宠，${resolveMoodLabel(state.mood)}，等级$level，好感度${state.affinity}，${state.speech}"
     }
 
     private fun resolveMoodLabel(mood: CompanionMood): String = when (mood) {
@@ -751,10 +904,11 @@ internal object BiliCompanionOverlayController {
     fun attach(
         lifecycleOwner: LifecycleOwner,
         root: ViewGroup,
-        onVideoClick: (String) -> Unit
+        onVideoClick: (String) -> Unit,
+        onAssistantAction: ((BiliCompanionAssistantAction) -> Unit)? = null
     ) {
         detach(lifecycleOwner)
-        val overlay = BiliCompanionOverlayView(root.context, onVideoClick)
+        val overlay = BiliCompanionOverlayView(root.context, onVideoClick, onAssistantAction)
         root.addView(
             overlay,
             FrameLayout.LayoutParams(

@@ -2,6 +2,7 @@
 package com.android.purebilibili.feature.video
 
 import android.Manifest
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.app.PictureInPictureParams
 import android.app.RemoteAction
@@ -29,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.metrics.performance.JankStats
 import com.android.purebilibili.core.store.SettingsManager
 import com.android.purebilibili.core.ui.AppThemeConfig
@@ -41,6 +43,10 @@ import com.android.purebilibili.core.util.resolveWindowWidthSizeClass
 import com.android.purebilibili.feature.video.viewmodel.VideoPlaybackViewModel
 import com.android.purebilibili.feature.video.viewmodel.VideoPlaybackUiState
 import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionOverlayController
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionAiService
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionAssistantAction
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionRuntime
+import kotlinx.coroutines.launch
 
 
 private const val TAG = "BiliPlayerActivity"
@@ -173,7 +179,28 @@ class VideoActivity : ComponentActivity() {
         BiliCompanionOverlayController.attach(
             lifecycleOwner = this,
             root = findViewById(android.R.id.content),
-            onVideoClick = { nextBvid -> VideoActivity.start(this, nextBvid) }
+            onVideoClick = { nextBvid -> VideoActivity.start(this, nextBvid) },
+            onAssistantAction = { action ->
+                if (action != BiliCompanionAssistantAction.AUTO_PAGE) {
+                    lifecycleScope.launch {
+                        BiliCompanionRuntime.showAssistantMessage("正在请求 AI，请稍等…", "AI 思考中")
+                        BiliCompanionAiService.execute(this@VideoActivity, bvid, action)
+                            .onSuccess { result ->
+                                BiliCompanionRuntime.showAssistantMessage("AI 结果已准备好", "分析完成")
+                                showCompanionAiResult(action, result)
+                            }
+                            .onFailure { error ->
+                                val message = error.message ?: "请求失败，请检查 AI 设置"
+                                BiliCompanionRuntime.showAssistantMessage(message, "AI 请求失败")
+                                AlertDialog.Builder(this@VideoActivity)
+                                    .setTitle("Bili-Companion AI")
+                                    .setMessage(message)
+                                    .setPositiveButton("知道了", null)
+                                    .show()
+                            }
+                    }
+                }
+            }
         )
         BiliCompanionOverlayController.setFullscreen(this, isFullscreen)
     }
@@ -240,6 +267,23 @@ class VideoActivity : ComponentActivity() {
         } else {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
+    }
+
+    private fun showCompanionAiResult(
+        action: BiliCompanionAssistantAction,
+        result: String
+    ) {
+        val title = when (action) {
+            BiliCompanionAssistantAction.TRANSLATE_TITLE -> "标题翻译"
+            BiliCompanionAssistantAction.SUMMARIZE_VIDEO -> "视频资料摘要"
+            BiliCompanionAssistantAction.FIND_COMMENTS -> "评论查找结果"
+            BiliCompanionAssistantAction.AUTO_PAGE -> "桌宠助手"
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(result)
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     //  构建 PiP 参数 (带播放控制按钮)

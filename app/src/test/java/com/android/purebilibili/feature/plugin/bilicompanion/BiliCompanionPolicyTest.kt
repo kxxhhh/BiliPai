@@ -69,4 +69,22 @@ class BiliCompanionPolicyTest {
         assertEquals(CompanionMood.PARTY, mood)
         assertTrue(BiliCompanionConfig().compactOnFullscreen)
     }
+
+    @Test
+    fun interactionKeywordsProduceCompanionEasterEggs() {
+        assertEquals("三连收到！", BiliCompanionMoodPolicy.signalFor("已三连支持").specialReaction)
+        assertEquals("早安，出发！", BiliCompanionMoodPolicy.signalFor("早安桌宠").specialReaction)
+        assertEquals("知识点记下了", BiliCompanionMoodPolicy.signalFor("这个知识点讲得清楚").specialReaction)
+    }
+
+    @Test
+    fun aiAndWatchReminderSettingsHaveConservativeDefaults() {
+        val config = BiliCompanionConfig()
+
+        assertEquals(false, config.aiEnabled)
+        assertEquals(BiliCompanionAiProvider.OPENAI_COMPATIBLE, config.aiProvider)
+        assertEquals("chat/completions", config.aiEndpointPath)
+        assertTrue(config.watchReminderEnabled)
+        assertEquals(45, config.watchReminderMinutes)
+    }
 }
