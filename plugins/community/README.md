@@ -36,6 +36,9 @@
 | 插件名称 | 描述 | 作者 | 链接 |
 |----------|------|------|------|
 | BP 示例过滤插件 | 示例 .bp 插件：过滤低质短视频与营销关键词，带 iconUrl | BiliPai Community Demo | [Raw](https://raw.githubusercontent.com/jay3-yy/BiliPai/codex/bp-demo-package/plugins/community/bp_demo_focus_filter.bp) |
+| Bili-Companion：蓝雪女仆桌宠 | `.bpplugin` Kotlin 包：真实二次元角色素材、签名和弹幕能力声明 | BiliPai项目组 | [包文件](./../../releases/Bili-Companion-1.1.0.bpplugin) |
+
+> `.bpplugin` 当前是预览格式：BiliPai 会校验包结构、SHA-256、签名和能力授权，但暂不执行外部 Dex。桌宠运行能力由宿主内置版本提供。
 
 ---
 

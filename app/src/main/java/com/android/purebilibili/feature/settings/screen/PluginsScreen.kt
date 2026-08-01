@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.android.purebilibili.R
 import com.android.purebilibili.core.plugin.ExternalPluginInstallDecision
+import com.android.purebilibili.core.plugin.ExternalPluginTrustStore
 import com.android.purebilibili.core.plugin.evaluateExternalPluginInstall
 import com.android.purebilibili.core.plugin.js.BiliPaiJsPluginInstallStore
 import com.android.purebilibili.core.plugin.js.BiliPaiJsPluginManifest
@@ -245,7 +246,10 @@ fun PluginsContent(
     var previewSourceUrl by remember { mutableStateOf<String?>(null) }
     var initialImportConsumed by remember(initialImportUrl) { mutableStateOf(false) }
     val kotlinPluginStore = remember(context) {
-        ExternalKotlinPluginInstallStore.createDefault(context)
+        ExternalKotlinPluginInstallStore.createDefault(
+            context,
+            trustedPublicKeys = ExternalPluginTrustStore.trustedPublicKeys()
+        )
     }
     val jsPluginStore = remember(context) {
         BiliPaiJsPluginInstallStore.createDefault(context)
@@ -338,7 +342,7 @@ fun PluginsContent(
                     val preview = kotlinPluginStore.previewPackage(bytes).getOrThrow()
                     val decision = evaluateExternalPluginInstall(
                         packageDescriptor = preview.descriptor,
-                        trustedSignerSha256 = emptySet()
+                        trustedSignerSha256 = ExternalPluginTrustStore.trustedSignerSha256
                     )
                     bytes to (preview to decision)
                 }

@@ -1,9 +1,13 @@
 package com.android.purebilibili.feature.plugin.bilicompanion
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -19,37 +23,47 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.android.purebilibili.R
 import com.android.purebilibili.core.plugin.PluginManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sign
+import kotlin.math.sin
+import kotlin.random.Random
 
 internal data class CompanionViewMetrics(
     val density: Float,
     val petSize: Float,
     val margin: Float,
     val bubbleHeight: Float,
-    val floorGap: Float
+    val floorGap: Float,
+    val gravity: Float,
+    val jumpImpulse: Float,
+    val maxWalkSpeed: Float
 ) {
     companion object {
         fun from(context: Context, width: Int, height: Int): CompanionViewMetrics {
             val density = context.resources.displayMetrics.density.coerceAtLeast(1f)
-            val shortSideDp = min(width, height) / density
-            val petDp = shortSideDp.coerceIn(52f, 82f)
+            val shortSideDp = min(width, height).toFloat() / density
+            val petDp = shortSideDp.coerceIn(64f, 96f)
             return CompanionViewMetrics(
                 density = density,
                 petSize = petDp * density,
                 margin = 12f * density,
-                bubbleHeight = 34f * density,
-                floorGap = 8f * density
+                bubbleHeight = 40f * density,
+                floorGap = 10f * density,
+                gravity = 1_080f * density,
+                jumpImpulse = 510f * density,
+                maxWalkSpeed = 132f * density
             )
         }
     }
 }
 
-internal class BiliCompanionBoundarySensor {
+private class CompanionBoundarySensor(private val density: Float) {
     private val obstacleRects = mutableListOf<Rect>()
     private val rootLocation = IntArray(2)
     var loadingDetected: Boolean = false
@@ -59,36 +73,54 @@ internal class BiliCompanionBoundarySensor {
         obstacleRects.clear()
         loadingDetected = false
         root.getLocationOnScreen(rootLocation)
-        collect(root, ignored)
+        collect(root, ignored, root)
+        obstacleRects.sortBy { it.top }
     }
 
-    fun resolveFloor(x: Float, width: Float, fallback: Float, height: Float): Float {
-        val right = x + width
+    fun resolveFloor(
+        x: Float,
+        petSize: Float,
+        currentTop: Float,
+        fallback: Float,
+        height: Float
+    ): Float {
+        val right = x + petSize
+        val minimumReachableTop = currentTop - petSize * 0.45f
         return obstacleRects
             .asSequence()
-            .filter { rect -> rect.right > x && rect.left < right && rect.top > width }
-            .map { it.top.toFloat() }
-            .filter { it < height }
+            .filter { rect -> rect.right > x && rect.left < right }
+            .map { it.top.toFloat() - petSize }
+            .filter { candidate ->
+                candidate >= minimumReachableTop && candidate >= density * 4f && candidate < height
+            }
             .minOrNull()
-            ?.minus(width)
             ?.coerceAtMost(fallback)
             ?: fallback
     }
 
-    private fun collect(view: View, ignored: View) {
-        if (view === ignored || !view.isShown || view.alpha < 0.05f) return
-        val isLoadingView = view.javaClass.simpleName.contains("Progress", true) ||
-            view.contentDescription?.contains("加载") == true
+    private fun collect(view: View, ignored: View, root: View) {
+        if (view === ignored) return
+        if (view !== root && (!view.isShown || view.alpha < 0.05f)) return
+
+        val className = view.javaClass.simpleName
+        val description = view.contentDescription?.toString().orEmpty()
+        val isLoadingView = className.contains("Progress", ignoreCase = true) ||
+            description.contains("加载") || description.contains("loading", ignoreCase = true)
+
         if (isLoadingView) loadingDetected = true
-        if (view !== ignored && (view.isClickable || view.isFocusable || isLoadingView)) {
+
+        if (view !== root && (view.isClickable || view.isFocusable || isLoadingView)) {
             val rect = Rect()
-            if (view.getGlobalVisibleRect(rect)) {
+            if (view.getGlobalVisibleRect(rect) && rect.width() >= density * 24f && rect.height() >= density * 12f) {
                 rect.offset(-rootLocation[0], -rootLocation[1])
                 obstacleRects += rect
             }
         }
+
         if (view is ViewGroup) {
-            for (index in 0 until view.childCount) collect(view.getChildAt(index), ignored)
+            for (index in 0 until view.childCount) {
+                collect(view.getChildAt(index), ignored, root)
+            }
         }
     }
 }
@@ -97,53 +129,66 @@ internal class BiliCompanionOverlayView(
     context: Context,
     private val onVideoClick: (String) -> Unit
 ) : View(context) {
-    private val displayMetrics = context.resources.displayMetrics
     private val accessibilityManager = context.getSystemService(AccessibilityManager::class.java)
-    private val boundarySensor = BiliCompanionBoundarySensor()
+    private val boundarySensor = CompanionBoundarySensor(context.resources.displayMetrics.density)
+    private val bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val bubbleRect = Rect()
+    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bubbleRect = RectF()
+    private val characterBitmap: Bitmap = BitmapFactory.decodeResource(
+        resources,
+        R.mipmap.ic_launcher_blue_snow_maid_front_foreground
+    )
     private var rootForBoundary: View? = null
     private var layoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
+    private var scrollListener: ViewTreeObserver.OnScrollChangedListener? = null
     private var metrics = CompanionViewMetrics.from(context, 1, 1)
     private var state = BiliCompanionState()
     private var enabled = false
     private var hostVisible = true
     private var hostFullscreen = false
-    private var x = 0f
-    private var y = 0f
+    private var centerX = 0f
+    private var centerY = 0f
     private var velocityX = 0f
     private var velocityY = 0f
     private var lastFrameNanos = 0L
-    private var dragOffsetX = 0f
-    private var dragOffsetY = 0f
+    private var lastBoundaryRefreshNanos = 0L
+    private var targetX = Float.NaN
+    private var nextDecisionAtMs = 0L
+    private var walkPhase = 0f
+    private var landingImpact = 0f
+    private var airborne = true
     private var dragging = false
     private var interactiveGesture = false
     private var scaleInProgress = false
+    private var fingerFollowActive = false
+    private var dragOffsetX = 0f
+    private var dragOffsetY = 0f
+    private val random = Random(0xB1C0_2026)
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean = true
 
         override fun onLongPress(event: MotionEvent) {
+            fingerFollowActive = true
             BiliCompanionRuntime.setFingerFollow(true)
             announceForAccessibility("已开启手指追随")
         }
 
         override fun onDoubleTap(event: MotionEvent): Boolean {
-            BiliCompanionRuntime.setCompact(true)
-            announceForAccessibility("电子桌宠已收起")
+            BiliCompanionRuntime.setCompact(!state.isCompact)
+            announceForAccessibility(if (state.isCompact) "电子桌宠已展开" else "电子桌宠已收起")
             return true
         }
 
         override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
             val bvid = state.speechBvid
             if (bvid != null && pointInBubble(event.x, event.y)) {
+                performClick()
                 BiliCompanionRuntime.clearSpeech()
                 onVideoClick(bvid)
-            } else if (state.isCompact) {
-                BiliCompanionRuntime.setCompact(false)
-                announceForAccessibility("电子桌宠已展开")
             } else {
-                announceForAccessibility(state.speech)
+                performClick()
             }
             return true
         }
@@ -156,7 +201,9 @@ internal class BiliCompanionOverlayView(
         }
 
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            BiliCompanionRuntime.setScale(state.scale * detector.scaleFactor)
+            val nextScale = (state.scale * detector.scaleFactor).coerceIn(0.72f, 1.6f)
+            BiliCompanionRuntime.setScale(nextScale)
+            clampCenter(metrics.petSize * nextScale)
             return true
         }
 
@@ -168,20 +215,23 @@ internal class BiliCompanionOverlayView(
     init {
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-        ViewCompat.setElevation(this, 4f * displayMetrics.density)
+        ViewCompat.setElevation(this, 6f * resources.displayMetrics.density)
+        setLayerType(LAYER_TYPE_SOFTWARE, null)
         setWillNotDraw(false)
-        contentDescription = "Bili-Companion电子桌宠，${state.speech}"
+        updateAccessibilityDescription()
     }
 
     fun setCompanionEnabled(value: Boolean) {
         enabled = value
         visibility = if (value && hostVisible && state.overlayEnabled) VISIBLE else INVISIBLE
+        if (value) lastFrameNanos = 0L
         invalidate()
     }
 
     fun setHostVisible(value: Boolean) {
         hostVisible = value
         visibility = if (value && enabled && state.overlayEnabled) VISIBLE else INVISIBLE
+        if (value) lastFrameNanos = 0L
         invalidate()
     }
 
@@ -194,28 +244,39 @@ internal class BiliCompanionOverlayView(
     }
 
     fun bindBoundaryRoot(root: View) {
+        unbindBoundaryRoot()
         rootForBoundary = root
         layoutListener = ViewTreeObserver.OnGlobalLayoutListener {
             boundarySensor.refresh(root, this)
             invalidate()
         }.also { root.viewTreeObserver.addOnGlobalLayoutListener(it) }
+        scrollListener = ViewTreeObserver.OnScrollChangedListener {
+            boundarySensor.refresh(root, this)
+            invalidate()
+        }.also { root.viewTreeObserver.addOnScrollChangedListener(it) }
         root.post { boundarySensor.refresh(root, this) }
     }
 
     fun unbindBoundaryRoot() {
         val root = rootForBoundary
-        val listener = layoutListener
-        if (root != null && listener != null && root.viewTreeObserver.isAlive) {
-            root.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+        if (root != null && root.viewTreeObserver.isAlive) {
+            layoutListener?.let(root.viewTreeObserver::removeOnGlobalLayoutListener)
+            scrollListener?.let(root.viewTreeObserver::removeOnScrollChangedListener)
         }
         rootForBoundary = null
         layoutListener = null
+        scrollListener = null
     }
 
     fun updateState(next: BiliCompanionState) {
+        val oldSize = currentPetSize()
         state = next
+        val newSize = currentPetSize()
+        if (oldSize > 0f && newSize > 0f && abs(oldSize - newSize) > 0.5f) {
+            clampCenter(newSize)
+        }
         visibility = if (enabled && hostVisible && next.overlayEnabled) VISIBLE else INVISIBLE
-        contentDescription = "Bili-Companion电子桌宠，${resolveMoodLabel(next.mood)}，${next.speech}"
+        updateAccessibilityDescription()
         if (next.speechBvid != null) {
             sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
         }
@@ -224,24 +285,40 @@ internal class BiliCompanionOverlayView(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         metrics = CompanionViewMetrics.from(context, width, height)
-        if (x == 0f && y == 0f) {
-            x = (width - metrics.petSize - metrics.margin).coerceAtLeast(metrics.margin)
-            y = metrics.margin
-        } else {
-            x = x.coerceIn(metrics.margin, (width - metrics.petSize - metrics.margin).coerceAtLeast(metrics.margin))
-            y = y.coerceIn(metrics.margin, (height - metrics.petSize - metrics.floorGap).coerceAtLeast(metrics.margin))
+        val size = currentPetSize()
+        if (centerX == 0f && centerY == 0f) {
+            centerX = width - metrics.margin - size / 2f
+            centerY = metrics.margin + size / 2f
         }
+        clampCenter(size)
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!enabled || !hostVisible || width <= 0 || height <= 0) return
+
         val now = System.nanoTime()
-        val deltaSeconds = if (lastFrameNanos == 0L) 0f else ((now - lastFrameNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
+        val deltaSeconds = if (lastFrameNanos == 0L) {
+            0f
+        } else {
+            ((now - lastFrameNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
+        }
         lastFrameNanos = now
-        if (!isTalkBackActive() && !hostFullscreen && !state.isFullscreen) advancePhysics(deltaSeconds)
+
+        if (now - lastBoundaryRefreshNanos > 900_000_000L) {
+            rootForBoundary?.let { boundarySensor.refresh(it, this) }
+            lastBoundaryRefreshNanos = now
+        }
+
+        val talkBackActive = isTalkBackActive()
+        if (!talkBackActive && !hostFullscreen && !state.isFullscreen) {
+            advancePhysics(deltaSeconds)
+        }
         drawCompanion(canvas)
-        postInvalidateOnAnimation()
+
+        if (!talkBackActive && !state.isCompact) {
+            postInvalidateOnAnimation()
+        }
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -250,8 +327,8 @@ internal class BiliCompanionOverlayView(
             interactiveGesture = pointInInteractiveRegion(event.x, event.y)
             if (!interactiveGesture) return false
             parent?.requestDisallowInterceptTouchEvent(true)
-            dragOffsetX = event.x - x
-            dragOffsetY = event.y - y
+            dragOffsetX = event.x - centerX
+            dragOffsetY = event.y - centerY
             dragging = false
         }
         if (!interactiveGesture) return false
@@ -262,34 +339,26 @@ internal class BiliCompanionOverlayView(
         if (!interactiveGesture) return false
         scaleDetector.onTouchEvent(event)
         gestureDetector.onTouchEvent(event)
-        if (event.actionMasked == MotionEvent.ACTION_MOVE && !scaleInProgress && state.fingerFollow) {
-            x = (event.x - dragOffsetX).coerceIn(metrics.margin, (width - metrics.petSize - metrics.margin).coerceAtLeast(metrics.margin))
-            y = (event.y - dragOffsetY).coerceIn(metrics.margin, (height - metrics.petSize - metrics.floorGap).coerceAtLeast(metrics.margin))
-            dragging = true
-            velocityX = 0f
-            velocityY = 0f
-            invalidate()
-        } else if (event.actionMasked == MotionEvent.ACTION_MOVE && !scaleInProgress && !state.isCompact) {
-            val nextX = (event.x - dragOffsetX).coerceIn(
-                metrics.margin,
-                (width - metrics.petSize - metrics.margin).coerceAtLeast(metrics.margin)
-            )
-            val nextY = (event.y - dragOffsetY).coerceIn(
-                metrics.margin,
-                (height - metrics.petSize - metrics.floorGap).coerceAtLeast(metrics.margin)
-            )
-            val dx = nextX - x
-            val dy = nextY - y
-            if (abs(dx) > metrics.density * 2f || abs(dy) > metrics.density * 2f) {
+
+        if (event.actionMasked == MotionEvent.ACTION_MOVE && !scaleInProgress && !state.isCompact) {
+            val nextX = event.x - dragOffsetX
+            val nextY = event.y - dragOffsetY
+            val movementThreshold = if (fingerFollowActive) 0f else metrics.density * 2f
+            if (abs(nextX - centerX) > movementThreshold || abs(nextY - centerY) > movementThreshold) {
                 dragging = true
-                x = nextX
-                y = nextY
-                velocityX = dx * 18f
-                velocityY = dy * 18f
+                centerX = nextX
+                centerY = nextY
+                velocityX = 0f
+                velocityY = 0f
+                airborne = true
+                targetX = Float.NaN
+                clampCenter(currentPetSize())
                 invalidate()
             }
         }
+
         if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            fingerFollowActive = false
             BiliCompanionRuntime.setFingerFollow(false)
             parent?.requestDisallowInterceptTouchEvent(false)
             interactiveGesture = false
@@ -300,7 +369,12 @@ internal class BiliCompanionOverlayView(
 
     override fun performClick(): Boolean {
         super.performClick()
-        BiliCompanionRuntime.setCompact(!state.isCompact)
+        if (state.isCompact) {
+            BiliCompanionRuntime.setCompact(false)
+            announceForAccessibility("电子桌宠已展开")
+        } else {
+            announceForAccessibility(state.speech)
+        }
         return true
     }
 
@@ -309,160 +383,289 @@ internal class BiliCompanionOverlayView(
         info.className = "android.widget.ImageButton"
         info.isClickable = true
         info.addAction(android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK)
-        info.text = "Bili-Companion电子桌宠，${resolveMoodLabel(state.mood)}，${state.speech}"
+        info.text = contentDescription
     }
 
     private fun advancePhysics(deltaSeconds: Float) {
-        if (dragging || state.isCompact) return
+        if (dragging || state.isCompact || deltaSeconds <= 0f) return
+
+        val size = currentPetSize()
+        val fallback = (height - size - metrics.floorGap).coerceAtLeast(metrics.margin)
+        val currentTop = centerY - size / 2f
         val floor = boundarySensor.resolveFloor(
-            x = x,
-            width = metrics.petSize,
-            fallback = height - metrics.petSize - metrics.floorGap,
+            x = centerX - size / 2f,
+            petSize = size,
+            currentTop = currentTop,
+            fallback = fallback,
             height = height.toFloat()
         )
-        velocityX += if (velocityX >= 0f) 10f * metrics.density * deltaSeconds else -10f * metrics.density * deltaSeconds
-        x += velocityX * deltaSeconds
-        y += velocityY * deltaSeconds
-        velocityY += 580f * metrics.density * deltaSeconds
-        if (x <= metrics.margin || x >= width - metrics.petSize - metrics.margin) {
-            x = x.coerceIn(metrics.margin, (width - metrics.petSize - metrics.margin).coerceAtLeast(metrics.margin))
-            velocityX *= -0.86f
+
+        if (!airborne && abs(currentTop - floor) > metrics.density * 3f) {
+            airborne = true
         }
-        if (y >= floor) {
-            y = floor
-            velocityY = -min(abs(velocityY) * 0.62f, 260f * metrics.density)
+
+        if (airborne) {
+            velocityY += metrics.gravity * deltaSeconds
+            centerX += velocityX * deltaSeconds
+            centerY += velocityY * deltaSeconds
+            val nextTop = centerY - size / 2f
+            if (nextTop >= floor && velocityY >= 0f) {
+                centerY = floor + size / 2f
+                landingImpact = (abs(velocityY) / metrics.jumpImpulse).coerceIn(0f, 1f)
+                velocityY = 0f
+                airborne = false
+                nextDecisionAtMs = System.currentTimeMillis() + random.nextLong(420L, 1_250L)
+            }
+        } else {
+            if (System.currentTimeMillis() >= nextDecisionAtMs || targetX.isNaN()) {
+                chooseNextAction(size)
+            }
+            val direction = sign(targetX - centerX)
+            val acceleration = 520f * metrics.density
+            velocityX = (velocityX + direction * acceleration * deltaSeconds)
+                .coerceIn(-metrics.maxWalkSpeed, metrics.maxWalkSpeed)
+            if (abs(targetX - centerX) < size * 0.2f) {
+                velocityX *= 0.82f
+            }
+            centerX += velocityX * deltaSeconds
+            centerY = floor + size / 2f
+            walkPhase += abs(velocityX) * deltaSeconds / size * 10f
         }
-        if (y <= metrics.margin) {
-            y = metrics.margin
-            velocityY = abs(velocityY) * 0.4f
+
+        if (centerX - size / 2f <= metrics.margin || centerX + size / 2f >= width - metrics.margin) {
+            centerX = centerX.coerceIn(
+                metrics.margin + size / 2f,
+                (width - metrics.margin - size / 2f).coerceAtLeast(metrics.margin + size / 2f)
+            )
+            velocityX *= -0.72f
+            targetX = Float.NaN
+        }
+        landingImpact = (landingImpact - deltaSeconds * 3.5f).coerceAtLeast(0f)
+    }
+
+    private fun chooseNextAction(size: Float) {
+        val minCenter = metrics.margin + size / 2f
+        val maxCenter = (width - metrics.margin - size / 2f).coerceAtLeast(minCenter)
+        targetX = minCenter + random.nextFloat() * (maxCenter - minCenter)
+        nextDecisionAtMs = System.currentTimeMillis() + random.nextLong(1_400L, 4_800L)
+
+        val jumpChance = when (state.mood) {
+            CompanionMood.PARTY -> 0.42f
+            CompanionMood.STUDY -> 0.18f
+            CompanionMood.BORED -> 0.08f
+        }
+        if (random.nextFloat() < jumpChance) {
+            velocityY = -metrics.jumpImpulse * (0.82f + random.nextFloat() * 0.24f)
+            velocityX = sign(targetX - centerX) * metrics.maxWalkSpeed * 0.82f
+            airborne = true
         }
     }
 
     private fun drawCompanion(canvas: Canvas) {
-        canvas.save()
-        canvas.scale(state.scale, state.scale, x + metrics.petSize / 2f, y + metrics.petSize / 2f)
-        val size = if (state.isCompact) metrics.petSize * 0.72f else metrics.petSize
-        val drawX = x + (metrics.petSize - size) / 2f
-        val drawY = if (state.isCompact) y + metrics.petSize - size else y
-        if (!state.isCompact && state.speech.isNotBlank()) drawSpeechBubble(canvas, drawX, drawY, size)
+        val size = currentPetSize()
+        val top = centerY - size / 2f
+        val left = centerX - size / 2f
+        val floor = boundarySensor.resolveFloor(
+            x = left,
+            petSize = size,
+            currentTop = top,
+            fallback = (height - size - metrics.floorGap).coerceAtLeast(metrics.margin),
+            height = height.toFloat()
+        )
 
-        paint.style = Paint.Style.FILL
-        paint.color = when (state.mood) {
-            CompanionMood.PARTY -> 0xFFFF8FA3.toInt()
-            CompanionMood.STUDY -> 0xFF7AC7C4.toInt()
-            CompanionMood.BORED -> 0xFF9AA6B2.toInt()
+        drawContactShadow(canvas, size, floor, top)
+        if (!state.isCompact && state.speech.isNotBlank()) {
+            drawSpeechBubble(canvas, left, top, size)
         }
-        canvas.drawCircle(drawX + size / 2f, drawY + size / 2f, size * 0.42f, paint)
-        paint.color = 0xFFFFE7C2.toInt()
-        canvas.drawCircle(drawX + size * 0.34f, drawY + size * 0.39f, size * 0.08f, paint)
-        canvas.drawCircle(drawX + size * 0.66f, drawY + size * 0.39f, size * 0.08f, paint)
-        paint.color = 0xFF30343B.toInt()
-        canvas.drawCircle(drawX + size * 0.35f, drawY + size * 0.4f, size * 0.035f, paint)
-        canvas.drawCircle(drawX + size * 0.65f, drawY + size * 0.4f, size * 0.035f, paint)
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = max(1f, size * 0.035f)
-        canvas.drawArc(drawX + size * 0.37f, drawY + size * 0.49f, drawX + size * 0.63f, drawY + size * 0.72f, 20f, 140f, false, paint)
+
+        val bob = if (airborne) 0f else sin(walkPhase) * size * 0.025f
+        val stretch = (abs(velocityY) / metrics.jumpImpulse).coerceIn(0f, 1f)
+        val squashY = (1f - stretch * 0.06f + landingImpact * 0.1f).coerceIn(0.9f, 1.08f)
+        val squashX = (1.04f - (squashY - 1f) * 0.55f).coerceIn(0.94f, 1.1f)
+
+        canvas.save()
+        canvas.translate(centerX, top + size / 2f + bob)
+        canvas.scale(if (velocityX < -metrics.density) -1f else 1f, 1f)
+        canvas.scale(squashX, squashY)
+        canvas.translate(-centerX, -(top + size / 2f))
+        canvas.drawBitmap(characterBitmap, null, RectF(left, top, left + size, top + size), bitmapPaint)
+        canvas.restore()
 
         when (state.mood) {
-            CompanionMood.PARTY -> drawSunglasses(canvas, drawX, drawY, size)
-            CompanionMood.STUDY -> drawGlasses(canvas, drawX, drawY, size)
-            CompanionMood.BORED -> drawSleepMarks(canvas, drawX, drawY, size)
+            CompanionMood.PARTY -> drawPartyDetails(canvas, left, top, size)
+            CompanionMood.STUDY -> drawStudyDetails(canvas, left, top, size)
+            CompanionMood.BORED -> drawSleepMarks(canvas, left, top, size)
         }
-        if (state.isEating) {
-            paint.style = Paint.Style.FILL
-            paint.color = 0xFFFFD166.toInt()
-            canvas.drawCircle(drawX + size * 0.84f, drawY + size * 0.31f, size * 0.06f, paint)
-        }
-        if (boundarySensor.loadingDetected && !state.isCompact) {
-            drawBroom(canvas, drawX, drawY, size)
-        }
-        drawFullness(canvas, drawX, drawY, size)
-        canvas.restore()
+        if (state.isEating) drawEatingSpark(canvas, left, top, size)
+        if (boundarySensor.loadingDetected && !state.isCompact) drawBroom(canvas, left, top, size)
+        if (!state.isCompact) drawFullness(canvas, left, top, size)
     }
 
-    private fun drawSpeechBubble(canvas: Canvas, drawX: Float, drawY: Float, size: Float) {
-        val maxWidth = min(width * 0.68f, 300f * metrics.density)
-        val text = state.speech.take(22)
+    private fun drawContactShadow(canvas: Canvas, size: Float, floor: Float, top: Float) {
+        val distance = (floor - top).coerceAtLeast(0f)
+        val opacity = (0x60 - (distance / size * 0x35).toInt()).coerceIn(0x18, 0x60)
+        shadowPaint.style = Paint.Style.FILL
+        shadowPaint.color = (opacity shl 24) or 0x001B2430
+        shadowPaint.setShadowLayer(
+            7f * metrics.density,
+            0f,
+            2f * metrics.density,
+            0x55000000
+        )
+        val shadowWidth = size * (0.42f - (distance / size).coerceIn(0f, 0.6f) * 0.12f)
+        canvas.drawOval(
+            centerX - shadowWidth,
+            floor + size * 0.88f,
+            centerX + shadowWidth,
+            floor + size * 0.98f,
+            shadowPaint
+        )
+        shadowPaint.clearShadowLayer()
+    }
+
+    private fun drawSpeechBubble(canvas: Canvas, left: Float, top: Float, size: Float) {
+        val density = metrics.density
+        val maxWidth = min(width * 0.72f, 300f * density)
+        val text = state.speech.take(18)
         paint.typeface = Typeface.DEFAULT_BOLD
-        paint.textSize = 12f * metrics.density
-        val textWidth = paint.measureText(text)
-        val bubbleWidth = min(maxWidth, max(96f * metrics.density, textWidth + 24f * metrics.density))
-        val left = (drawX + size / 2f - bubbleWidth / 2f).coerceIn(metrics.margin, width - bubbleWidth - metrics.margin)
-        val top = (drawY - metrics.bubbleHeight - 6f * metrics.density).coerceAtLeast(metrics.margin)
-        bubbleRect.set(left.toInt(), top.toInt(), (left + bubbleWidth).toInt(), (top + metrics.bubbleHeight).toInt())
+        paint.textSize = 12f * density
+        val actionWidth = if (state.speechBvid != null) 42f * density else 0f
+        val bubbleWidth = min(
+            maxWidth,
+            max(120f * density, paint.measureText(text) + 28f * density + actionWidth)
+        )
+        val bubbleLeft = (centerX - bubbleWidth / 2f).coerceIn(
+            metrics.margin,
+            (width - bubbleWidth - metrics.margin).coerceAtLeast(metrics.margin)
+        )
+        val bubbleTop = (top - metrics.bubbleHeight - 9f * density).coerceAtLeast(metrics.margin)
+        bubbleRect.set(
+            bubbleLeft,
+            bubbleTop,
+            bubbleLeft + bubbleWidth,
+            bubbleTop + metrics.bubbleHeight
+        )
+
         paint.style = Paint.Style.FILL
-        paint.color = 0xF9FFFFFF.toInt()
-        canvas.drawRoundRect(bubbleRect.left.toFloat(), bubbleRect.top.toFloat(), bubbleRect.right.toFloat(), bubbleRect.bottom.toFloat(), 16f * metrics.density, 16f * metrics.density, paint)
+        paint.color = 0xF7FFFFFF.toInt()
+        paint.setShadowLayer(7f * density, 0f, 2f * density, 0x48000000)
+        canvas.drawRoundRect(bubbleRect, 17f * density, 17f * density, paint)
+        paint.clearShadowLayer()
+
+        val tail = Path().apply {
+            moveTo(centerX - 7f * density, bubbleRect.bottom - 1f * density)
+            lineTo(centerX, top - 2f * density)
+            lineTo(centerX + 7f * density, bubbleRect.bottom - 1f * density)
+            close()
+        }
+        paint.color = 0xF7FFFFFF.toInt()
+        canvas.drawPath(tail, paint)
+
         paint.color = 0xFF263238.toInt()
-        canvas.drawText(text, left + 12f * metrics.density, top + 21f * metrics.density, paint)
+        paint.textSize = 12f * density
+        canvas.drawText(text, bubbleRect.left + 14f * density, bubbleRect.top + 25f * density, paint)
         if (state.speechBvid != null) {
-            paint.color = 0xFFE85D75.toInt()
-            paint.textSize = 9f * metrics.density
-            canvas.drawText("点击查看", left + bubbleWidth - 48f * metrics.density, top + 21f * metrics.density, paint)
+            paint.color = 0xFFE45C78.toInt()
+            paint.textSize = 10f * density
+            canvas.drawText("打开", bubbleRect.right - 34f * density, bubbleRect.top + 25f * density, paint)
         }
     }
 
-    private fun drawFullness(canvas: Canvas, drawX: Float, drawY: Float, size: Float) {
+    private fun drawFullness(canvas: Canvas, left: Float, top: Float, size: Float) {
+        val y = top + size + metrics.density * 5f
+        paint.style = Paint.Style.FILL
+        paint.color = 0x3DFFFFFF
+        canvas.drawRoundRect(left + size * 0.1f, y, left + size * 0.9f, y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
+        paint.color = 0xFFFFC857.toInt()
+        canvas.drawRoundRect(left + size * 0.1f, y, left + size * (0.1f + 0.8f * state.fullness), y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
+    }
+
+    private fun drawPartyDetails(canvas: Canvas, left: Float, top: Float, size: Float) {
+        paint.style = Paint.Style.FILL
+        paint.color = 0xE52D3540.toInt()
+        canvas.drawRoundRect(left + size * 0.22f, top + size * 0.4f, left + size * 0.47f, top + size * 0.5f, size * 0.04f, size * 0.04f, paint)
+        canvas.drawRoundRect(left + size * 0.53f, top + size * 0.4f, left + size * 0.78f, top + size * 0.5f, size * 0.04f, size * 0.04f, paint)
+        paint.strokeWidth = max(metrics.density, size * 0.025f)
+        canvas.drawLine(left + size * 0.47f, top + size * 0.44f, left + size * 0.53f, top + size * 0.44f, paint)
+        paint.color = 0xFFFFC857.toInt()
+        canvas.drawCircle(left + size * 0.08f, top + size * 0.18f, size * 0.035f, paint)
+        canvas.drawCircle(left + size * 0.92f, top + size * 0.25f, size * 0.035f, paint)
+        paint.color = 0xFFE45C78.toInt()
+        canvas.drawCircle(left + size * 0.14f, top + size * 0.72f, size * 0.025f, paint)
+        canvas.drawCircle(left + size * 0.88f, top + size * 0.68f, size * 0.025f, paint)
+    }
+
+    private fun drawStudyDetails(canvas: Canvas, left: Float, top: Float, size: Float) {
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = max(1f, 2f * metrics.density)
-        paint.color = 0x66FFFFFF
-        canvas.drawRoundRect(drawX, drawY + size + metrics.density, drawX + size, drawY + size + 5f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
+        paint.strokeWidth = max(metrics.density, size * 0.018f)
+        paint.color = 0xFF5B6470.toInt()
+        canvas.drawOval(left + size * 0.2f, top + size * 0.39f, left + size * 0.47f, top + size * 0.52f, paint)
+        canvas.drawOval(left + size * 0.53f, top + size * 0.39f, left + size * 0.8f, top + size * 0.52f, paint)
+        canvas.drawLine(left + size * 0.47f, top + size * 0.44f, left + size * 0.53f, top + size * 0.44f, paint)
         paint.style = Paint.Style.FILL
-        paint.color = 0xFFFFD166.toInt()
-        canvas.drawRoundRect(drawX, drawY + size + metrics.density, drawX + size * state.fullness, drawY + size + 5f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
-    }
-
-    private fun drawSunglasses(canvas: Canvas, x: Float, y: Float, size: Float) {
-        paint.style = Paint.Style.FILL
-        paint.color = 0xFF30343B.toInt()
-        canvas.drawRoundRect(x + size * 0.2f, y + size * 0.34f, x + size * 0.47f, y + size * 0.48f, size * 0.05f, size * 0.05f, paint)
-        canvas.drawRoundRect(x + size * 0.53f, y + size * 0.34f, x + size * 0.8f, y + size * 0.48f, size * 0.05f, size * 0.05f, paint)
-        canvas.drawRect(x + size * 0.46f, y + size * 0.38f, x + size * 0.54f, y + size * 0.42f, paint)
-    }
-
-    private fun drawGlasses(canvas: Canvas, x: Float, y: Float, size: Float) {
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = max(1f, size * 0.025f)
-        paint.color = 0xFF4A5D67.toInt()
-        canvas.drawOval(x + size * 0.2f, y + size * 0.33f, x + size * 0.47f, y + size * 0.5f, paint)
-        canvas.drawOval(x + size * 0.53f, y + size * 0.33f, x + size * 0.8f, y + size * 0.5f, paint)
-        canvas.drawLine(x + size * 0.47f, y + size * 0.4f, x + size * 0.53f, y + size * 0.4f, paint)
-    }
-
-    private fun drawSleepMarks(canvas: Canvas, x: Float, y: Float, size: Float) {
-        paint.style = Paint.Style.FILL
+        paint.color = 0xFF4D8C8A.toInt()
+        paint.textSize = size * 0.16f
         paint.typeface = Typeface.DEFAULT_BOLD
-        paint.textSize = size * 0.18f
-        paint.color = 0xFF425466.toInt()
-        canvas.drawText("呼", x + size * 0.75f, y + size * 0.18f, paint)
-        canvas.drawText("呼", x + size * 0.88f, y + size * 0.05f, paint)
+        canvas.drawText("记", left + size * 0.8f, top + size * 0.18f, paint)
     }
 
-    private fun drawBroom(canvas: Canvas, x: Float, y: Float, size: Float) {
-        val progress = ((System.nanoTime() / 12_000_000L) % 100L) / 100f
-        val sweep = (progress * 2f - 1f) * size * 0.34f
+    private fun drawSleepMarks(canvas: Canvas, left: Float, top: Float, size: Float) {
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFF587080.toInt()
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textSize = size * 0.15f
+        canvas.drawText("呼", left + size * 0.78f, top + size * 0.16f, paint)
+        paint.textSize = size * 0.22f
+        canvas.drawText("呼", left + size * 0.92f, top - size * 0.02f, paint)
+    }
+
+    private fun drawEatingSpark(canvas: Canvas, left: Float, top: Float, size: Float) {
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFFFFC857.toInt()
+        val pulse = 0.04f + (sin(walkPhase * 2f) + 1f) * 0.025f
+        canvas.drawCircle(left + size * 0.88f, top + size * 0.64f, size * pulse, paint)
+        canvas.drawCircle(left + size * 0.96f, top + size * 0.56f, size * pulse * 0.65f, paint)
+    }
+
+    private fun drawBroom(canvas: Canvas, left: Float, top: Float, size: Float) {
+        val sweep = sin(walkPhase * 0.45f) * size * 0.18f
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = max(1f, size * 0.035f)
-        paint.color = 0xFFB7791F.toInt()
-        canvas.drawLine(x + size * 0.5f, y + size * 0.78f, x + size * 0.5f + sweep, y + size * 0.98f, paint)
-        paint.color = 0xFFFFD166.toInt()
-        canvas.drawLine(x + size * 0.27f + sweep, y + size * 0.98f, x + size * 0.73f + sweep, y + size * 0.98f, paint)
+        paint.strokeWidth = max(metrics.density, size * 0.018f)
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.color = 0xFF9A6A43.toInt()
+        canvas.drawLine(left + size * 0.62f, top + size * 0.8f, left + size * 0.5f + sweep, top + size * 1.08f, paint)
+        paint.color = 0xFFE7B65C.toInt()
+        canvas.drawLine(left + size * 0.28f + sweep, top + size * 1.08f, left + size * 0.68f + sweep, top + size * 1.08f, paint)
+        paint.strokeCap = Paint.Cap.BUTT
     }
 
     private fun pointInInteractiveRegion(eventX: Float, eventY: Float): Boolean {
-        if (state.isCompact) {
-            val compactSize = metrics.petSize * 0.72f
-            val compactX = x + (metrics.petSize - compactSize) / 2f
-            return eventX in compactX..(compactX + compactSize) && eventY in (y + metrics.petSize - compactSize)..(y + metrics.petSize)
-        }
         return pointInPet(eventX, eventY) || pointInBubble(eventX, eventY)
     }
 
-    private fun pointInPet(eventX: Float, eventY: Float): Boolean =
-        eventX in x..(x + metrics.petSize) && eventY in y..(y + metrics.petSize + 8f * metrics.density)
+    private fun pointInPet(eventX: Float, eventY: Float): Boolean {
+        val size = currentPetSize()
+        val left = centerX - size / 2f
+        val top = centerY - size / 2f
+        return eventX in left..(left + size) && eventY in top..(top + size + metrics.density * 8f)
+    }
 
-    private fun pointInBubble(eventX: Float, eventY: Float): Boolean =
-        !bubbleRect.isEmpty && bubbleRect.contains(eventX.toInt(), eventY.toInt())
+    private fun pointInBubble(eventX: Float, eventY: Float): Boolean = bubbleRect.contains(eventX, eventY)
+
+    private fun currentPetSize(): Float {
+        val compactFactor = if (state.isCompact) 0.7f else 1f
+        return metrics.petSize * state.scale * compactFactor
+    }
+
+    private fun clampCenter(size: Float) {
+        if (width <= 0 || height <= 0) return
+        val minCenterX = metrics.margin + size / 2f
+        val maxCenterX = (width - metrics.margin - size / 2f).coerceAtLeast(minCenterX)
+        val minCenterY = metrics.margin + size / 2f
+        val maxCenterY = (height - metrics.floorGap - size / 2f).coerceAtLeast(minCenterY)
+        centerX = centerX.coerceIn(minCenterX, maxCenterX)
+        centerY = centerY.coerceIn(minCenterY, maxCenterY)
+    }
 
     private fun isTalkBackActive(): Boolean =
         accessibilityManager?.isEnabled == true && accessibilityManager.isTouchExplorationEnabled
@@ -470,6 +673,10 @@ internal class BiliCompanionOverlayView(
     private fun announceForAccessibility(message: String) {
         contentDescription = "Bili-Companion电子桌宠，$message"
         if (isShown) super.announceForAccessibility(message)
+    }
+
+    private fun updateAccessibilityDescription() {
+        contentDescription = "Bili-Companion电子桌宠，${resolveMoodLabel(state.mood)}，${state.speech}"
     }
 
     private fun resolveMoodLabel(mood: CompanionMood): String = when (mood) {
