@@ -103,18 +103,21 @@ jobs:
           if [ ! -s "$WORK_DIR/raw_failed.log" ]; then
             echo "Failed-log output was empty; fetching the complete run log..."
             if ! gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log > "$WORK_DIR/raw_failed.log" 2>> "$GH_ERROR_FILE"; then
-              echo "::error::Unable to download the triggering workflow logs."
+              echo "::warning::Unable to download logs for the triggering workflow; skipping AI analysis."
               cat "$GH_ERROR_FILE" >&2
-              exit 1
+              echo "has_logs=false" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           fi
 
           if [ ! -s "$WORK_DIR/raw_failed.log" ]; then
-            echo "::error::The triggering workflow returned no log content."
+            echo "::warning::The triggering workflow returned no log content; skipping AI analysis."
             cat "$GH_ERROR_FILE" >&2
-            exit 1
+            echo "has_logs=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          echo "has_logs=true" >> "$GITHUB_OUTPUT"
           sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
             "$WORK_DIR/raw_failed.log" > "$WORK_DIR/clean_failed.log"
           tail -n 200 "$WORK_DIR/clean_failed.log" > "$WORK_DIR/build_error.log"
@@ -125,6 +128,7 @@ jobs:
 
       - name: Call ToolCode AI to fix bugs
         id: ai_fix
+        if: steps.get_logs.outputs.has_logs == 'true'
         env:
           TOOLCODE_API_KEY: ${{ secrets.TOOLCODE_API_KEY }}
         run: |
@@ -191,6 +195,7 @@ jobs:
 
       - name: Apply AI fix
         id: apply
+        if: steps.get_logs.outputs.has_logs == 'true'
         run: |
           set -Eeuo pipefail
           RESPONSE_FILE="$WORK_DIR/ai_response.json"
