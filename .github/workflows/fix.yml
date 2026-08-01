@@ -66,7 +66,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
-      WORK_DIR: ${{ runner.temp }}/toolcode-ai-fix
 
     steps:
       - name: Show trigger context
@@ -76,6 +75,9 @@ jobs:
           echo "Workflow run ID: $RUN_ID"
           echo "Workflow name: ${{ github.event.workflow_run.name || 'manual' }}"
           echo "Conclusion: ${{ github.event.workflow_run.conclusion || 'manual' }}"
+
+      - name: Initialize debugger workspace
+        run: echo "WORK_DIR=$RUNNER_TEMP/toolcode-ai-fix" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
