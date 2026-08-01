@@ -12,4 +12,5 @@ internal fun resolvePluginDefaultEnabled(pluginId: String): Boolean {
 private val BUILTIN_DEFAULT_ENABLED_PLUGIN_IDS = setOf(
     "dlna_cast",
     "google_cast",
+    "bili_companion",
 )

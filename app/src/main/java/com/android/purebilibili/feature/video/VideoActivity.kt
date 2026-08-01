@@ -40,6 +40,7 @@ import com.android.purebilibili.core.util.resolveWindowWidthSizeClass
 // Imports for moved classes
 import com.android.purebilibili.feature.video.viewmodel.VideoPlaybackViewModel
 import com.android.purebilibili.feature.video.viewmodel.VideoPlaybackUiState
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionOverlayController
 
 
 private const val TAG = "BiliPlayerActivity"
@@ -169,10 +170,17 @@ class VideoActivity : ComponentActivity() {
                 }
             }
         }
+        BiliCompanionOverlayController.attach(
+            lifecycleOwner = this,
+            root = findViewById(android.R.id.content),
+            onVideoClick = { nextBvid -> VideoActivity.start(this, nextBvid) }
+        )
+        BiliCompanionOverlayController.setFullscreen(this, isFullscreen)
     }
 
     override fun onStart() {
         super.onStart()
+        BiliCompanionOverlayController.setHostVisible(this, true)
         AppRuntimeVisualGuardTracker.activateSession(runtimeVisualGuardSession)
         val existingJankStats = runtimeJankStats
         if (existingJankStats != null) {
@@ -193,12 +201,14 @@ class VideoActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        BiliCompanionOverlayController.setHostVisible(this, false)
         AppRuntimeVisualGuardTracker.discardActiveWindow(runtimeVisualGuardSession)
         runtimeJankStats?.isTrackingEnabled = false
         super.onStop()
     }
     
     override fun onDestroy() {
+        BiliCompanionOverlayController.detach(this)
         runtimeJankStats?.isTrackingEnabled = false
         runtimeJankStats = null
         super.onDestroy()
@@ -221,6 +231,7 @@ class VideoActivity : ComponentActivity() {
     private fun updateStateFromConfig(config: Configuration) {
         val isLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
         isFullscreen = isLandscape
+        BiliCompanionOverlayController.setFullscreen(this, isFullscreen)
     }
 
     private fun toggleFullscreen() {

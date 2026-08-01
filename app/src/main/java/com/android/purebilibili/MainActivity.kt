@@ -142,6 +142,8 @@ import com.android.purebilibili.feature.video.player.MiniPlayerManager
 import com.android.purebilibili.feature.video.player.buildPipPlaybackRemoteActions
 import com.android.purebilibili.feature.video.ui.overlay.FullscreenPlayerOverlay
 import com.android.purebilibili.feature.video.ui.overlay.MiniPlayerOverlay
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionOverlayController
+import com.android.purebilibili.feature.video.VideoActivity
 import com.android.purebilibili.navigation.AppNavigation
 import com.android.purebilibili.navigation.ScreenRoutes
 import com.android.purebilibili.navigation.VideoRoute
@@ -1094,6 +1096,11 @@ open class MainActivity : AppCompatActivity() {
             )
         }
         setContentView(rootContainer)
+        BiliCompanionOverlayController.attach(
+            lifecycleOwner = this,
+            root = rootContainer,
+            onVideoClick = { bvid -> VideoActivity.start(this, bvid) }
+        )
 
         composeContentView.setContent {
             val context = LocalContext.current
@@ -1273,6 +1280,12 @@ open class MainActivity : AppCompatActivity() {
                     val isPipRenderingActive =
                         isInPipMode || miniPlayerManager.shouldKeepPlaybackForPipTransition()
                     val isFullscreenPlayerLocked = AppScreenshotGestureBlockState.fullscreenPlayerLocked
+                    LaunchedEffect(isFullscreenPlayerLocked, isInPipMode) {
+                        BiliCompanionOverlayController.setFullscreen(
+                            this@MainActivity,
+                            isFullscreenPlayerLocked || isInPipMode
+                        )
+                    }
                     var isAppScreenshotBlockedBySplash by remember { mutableStateOf(false) }
                     var isAppScreenshotSaving by remember { mutableStateOf(false) }
                     var appScreenshotRegionBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -1951,6 +1964,7 @@ open class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        BiliCompanionOverlayController.setHostVisible(this, true)
         AppRuntimeVisualGuardTracker.activateSession(runtimeVisualGuardSession)
         val existingJankStats = runtimeJankStats
         if (existingJankStats != null) {
@@ -1977,6 +1991,7 @@ open class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        BiliCompanionOverlayController.setHostVisible(this, false)
         AppRuntimeVisualGuardTracker.discardActiveWindow(runtimeVisualGuardSession)
         runtimeJankStats?.isTrackingEnabled = false
         super.onStop()
@@ -2245,6 +2260,7 @@ open class MainActivity : AppCompatActivity() {
     }
     
     override fun onDestroy() {
+        BiliCompanionOverlayController.detach(this)
         runtimeJankStats?.isTrackingEnabled = false
         runtimeJankStats = null
         super.onDestroy()

@@ -36,6 +36,7 @@ import com.android.purebilibili.feature.plugin.EyeProtectionPlugin
 import com.android.purebilibili.feature.plugin.TodayWatchPlugin
 import com.android.purebilibili.feature.plugin.TodayWatchPluginConfig
 import com.android.purebilibili.feature.plugin.TodayWatchPluginMode
+import com.android.purebilibili.feature.plugin.bilicompanion.BiliCompanionRuntime
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -1548,6 +1549,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 fullResult.onSuccess { fullFeed ->
                     val fullVideos = mapHomeFollowDynamicItemsToVideos(fullFeed.items)
+                    BiliCompanionRuntime.onFollowFeedLoaded(fullVideos)
                     tipCount = resolveHomeFollowRefreshNewItemsCount(
                         usedUpdateBaseline = true,
                         apiUpdateNum = apiUpdateNum,
@@ -1604,6 +1606,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
             }
+            BiliCompanionRuntime.onFollowFeedLoaded(videos)
         }.onFailure { error ->
              updateCategoryState(HomeCategory.FOLLOW) { oldState ->
                 oldState.copy(

@@ -10,6 +10,7 @@ class BuiltinPluginDefaultPolicyTest {
     fun castPluginsAreEnabledByDefault() {
         assertTrue(resolvePluginDefaultEnabled("dlna_cast"))
         assertTrue(resolvePluginDefaultEnabled("google_cast"))
+        assertTrue(resolvePluginDefaultEnabled("bili_companion"))
     }
 
     @Test
