@@ -1,0 +1,121 @@
+name: Global ToolCode AI Debugger
+
+on:
+  workflow_run:
+    workflows: ["*"] # 监听仓库里所有的工作流，任何一个挂了都会触发
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read       # 跨工作流读取失败日志所必需的权限
+
+jobs:
+  analyze-and-fix:
+    # 只有当被监听的工作流是【失败状态 (failure)】时才执行修复
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_branch }}
+
+    # ==========================================
+    # 1. 跨工作流提取失败日志，并清洗乱码
+    # ==========================================
+    - name: Download and Clean Failed Logs
+      id: get_logs
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        RUN_ID="${{ github.event.workflow_run.id }}"
+        echo "检测到工作流失败，正在拉取 Run ID: $RUN_ID 的错误日志..."
+        
+        # 使用 GitHub CLI 获取失败的步骤日志
+        gh run view "$RUN_ID" --log-failed > raw_failed.log || true
+        
+        if [ ! -s raw_failed.log ]; then
+          echo "无法直接获取，尝试拉取最后的标准输出..."
+          gh run view "$RUN_ID" --log > raw_failed.log || true
+        fi
+        
+        # 清洗日志：移除终端里的 ANSI 颜色代码（如 \u001b[31m 等），避免污染 AI 上下文
+        sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" raw_failed.log > clean_failed.log
+        
+        # 截取最后 150 行最核心的报错交给 AI
+        tail -n 150 clean_failed.log > build_error.log
+        echo "--- 已成功捕获并清洗完毕的错误日志 ---"
+        cat build_error.log
+
+    # ==========================================
+    # 2. 安全调用 toolcode.top 的 gpt-5.6-luna 接口
+    # ==========================================
+    - name: Call ToolCode AI to Fix Bugs
+      id: ai_fix
+      run: |
+        # 将日志进行转义，转为符合标准 JSON 规范的单行文本
+        ERROR_LOG=$(cat build_error.log | jq -sRr @json)
+        
+        # 构造发往 toolcode.top 的 Payload
+        PAYLOAD=$(cat <<EOF
+        {
+          "model": "gpt-5.6-luna",
+          "messages": [
+            {
+              "role": "user",
+              "content": "我的项目在 CI/CD 自动化流水线中编译或运行失败了。以下是最后的错误日志：\n--- \n $ERROR_LOG \n ---\n请分析报错的文件和原因，并给出修复后的完整代码，以便我能直接覆盖源文件。\n请严格按照以下纯 JSON 格式输出，不要包含任何 markdown 块或 \`\`\`json 标记：\n{\n  \"file_path\": \"发生错误的源文件相对路径\",\n  \"fixed_content\": \"修改后的完整代码内容\"\n}"
+            }
+          ],
+          "response_format": { "type": "json_object" }
+        }
+        EOF
+        )
+
+        # 核心：这里的 Key 通过 ${{ secrets.TOOLCODE_API_KEY }} 动态安全注入
+        RESPONSE=$(curl -s -X POST "https://toolcode.top/v1/chat/completions" \
+          -H "Authorization: Bearer ${{ secrets.TOOLCODE_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD")
+
+        # 提取并保存响应
+        AI_CONTENT=$(echo "$RESPONSE" | jq -r '.choices.message.content')
+        echo "$AI_CONTENT" > ai_response.json
+
+    # ==========================================
+    # 3. 解析并自动覆盖修复
+    # ==========================================
+    - name: Apply AI Fixes
+      run: |
+        if [ -f ai_response.json ]; then
+          FILE_PATH=$(jq -r '.file_path' ai_response.json)
+          FIXED_CONTENT=$(jq -r '.fixed_content' ai_response.json)
+          
+          if [ "$FILE_PATH" != "null" ] && [ -n "$FIXED_CONTENT" ]; then
+            # 直接覆盖存在编译 Bug 的旧文件
+            echo "$FIXED_CONTENT" > "$FILE_PATH"
+            echo "✅ ToolCode AI 成功针对失败的流水线修改了文件: $FILE_PATH"
+          else
+            echo "❌ 失败: 无法解析 toolcode.top 返回的 JSON 数据结构。"
+            cat ai_response.json
+            exit 1
+          fi
+        fi
+
+    # ==========================================
+    # 4. 自动创建 Pull Request
+    # ==========================================
+    - name: Create Pull Request with Fix
+      uses: peter-evans/create-pull-request@v6
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: "fix(ai): automatically fix failed workflow via gpt-5.6-luna"
+        title: "🤖 [AI 自动化修复] 纠正流 ${{ github.event.workflow_run.name }} 报错"
+        body: |
+          检测到工作流 **${{ github.event.workflow_run.name }}** 运行失败。
+          
+          ToolCode 已经启动 `gpt-5.6-luna` 精准抓取了失败日志，并自动修改了可能有 Bug 的源码文件，请人工 Review 确认。
+        branch: toolcode-ai-fix-branch
+        delete-branch: true
