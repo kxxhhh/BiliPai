@@ -1,0 +1,81 @@
+我准备好了包含独立部件和完整序列帧的精灵图 drawable/pet_sprites.png。请修改代码：彻底移除矢量手绘，改为通过在 onDraw() 中轮流切片绘制 ‘WALK CYCLE’ 的帧来实现桌宠的巡游动画；并在触发跳跃或‘加载中’状态时，切换到 ‘RUN’ 或 ‘JUMP’ 的序列帧。”
+​方案：基于下半部分“序列帧（Sprite Sheet）”的动画渲染
+请修改 BiliCompanionOverlayView，实现基于 pet_sprites.png 精灵图的序列帧动画：
+
+1. 加载图片：读取 pet_sprites.png 资源为 Bitmap。
+2. 网格切片（srcRect）：
+   * 该动画位于图片下半部分（WALK 系列）。
+   * 共 6 帧，单帧宽度 = bitmap.width / 18，单帧高度 = bitmap.height / 5。
+   * 每一帧的 srcRect 计算公式：
+     left = frameIndex * frameWidth
+     top = (bitmap.height / 5) * 2
+     right = left + frameWidth
+     bottom = top + frameHeight
+3. 定时刷帧：
+   * 在 Handler 或 Coroutine 中启动 100ms 间隔的定时器，更新当前帧索引 currentFrame = (currentFrame + 1) % totalFrames，并触发 invalidate()。
+4. 渲染绘制（dstRect）：
+   * 在 onDraw 中使用 canvas.drawBitmap(spriteBitmap, srcRect, dstRect, paint) 绘制当前帧。
+   * 向右移动时正常绘制，向左移动时通过 canvas.scale(-1f, 1f, dstRect.centerX(), dstRect.centerY()) 实现水平翻转。
+. 变量与帧率控制
+private val spriteBitmap: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.pet_sprites)
+private var currentFrame = 0
+private val totalFrames = 6
+private val frameInterval = 100L // 毫秒
+private val handler = Handler(Looper.getMainLooper())
+
+private val updateFrameRunnable = object : Runnable {
+    override fun run() {
+        currentFrame = (currentFrame + 1) % totalFrames
+        invalidate()
+        handler.postDelayed(this, frameInterval)
+    }
+}
+
+init {
+    handler.post(updateFrameRunnable)
+}
+2. onDraw 中的切片与绘制逻辑
+override fun onDraw(canvas: Canvas) {
+    super.onDraw(canvas)
+
+    val sheetWidth = spriteBitmap.width
+    val sheetHeight = spriteBitmap.height
+    
+    // 计算单帧宽高（假设按 18 列、5 行网格划分）
+    val frameWidth = sheetWidth / 18
+    val frameHeight = sheetHeight / 5
+
+    // 计算当前帧在 Sprite Sheet 中的源矩形区域 (srcRect)
+    val srcX = currentFrame * frameWidth
+    val srcY = frameHeight * 2 // 对应行走动作所在行
+    val srcRect = Rect(srcX, srcY, srcX + frameWidth, srcY + frameHeight)
+
+    // 屏幕上实际显示的目标矩形区域 (dstRect)
+    val dstRect = RectF(posX, posY, posX + targetWidth, posY + targetHeight)
+
+    canvas.save()
+    // 如果需要左右转向，可在此处应用 Matrix 翻转
+    if (isMovingLeft) {
+        canvas.scale(-1f, 1f, dstRect.centerX(), dstRect.centerY())
+    }
+
+    // 核心贴图渲染
+    canvas.drawBitmap(spriteBitmap, srcRect, dstRect, null)
+    canvas.restore()
+}
+​请使用 pet_sprites.png 上半部分的独立部件进行 Canvas 图层拼装：
+​部件定位基准（以原图网格划分，Y 轴范围：0 ~ bitmap.height * 0.4）：
+​头部 (Head)：srcRect = Rect(0, 0, unitW * 2, unitH * 1.5)
+​表情 (Face/Eyes)：srcRect = Rect(unitW * 3, 0, unitW * 4, unitH)
+​躯干 (Torso)：srcRect = Rect(unitW * 5, 0, unitW * 7, unitH * 1.2)
+​手臂/腿 (Limbs)：srcRect = Rect(unitW * 8, 0, unitW * 11, unitH)
+​裙子/鞋子 (Skirt/Boots)：srcRect = Rect(unitW * 12, 0, unitW * 15, unitH)
+​拼装渲染逻辑（onDraw）：
+​在 dstRect 的相对坐标中，从后往前按顺序绘制：
+​drawBitmap(后发)
+​drawBitmap(躯干)
+​drawBitmap(腿部与鞋子)
+​drawBitmap(头部) + drawBitmap(表情)
+​drawBitmap(手臂) （可通过 canvas.rotate() 绕肩部关节旋转实现摆手）
+​呼吸/呼吸微动效果：
+​使用定时器给“头部”和“手臂”的绘制 Y 轴坐标加上一个 \sin(\text{time}) 的微小偏移，即可实现待机呼吸效果！
