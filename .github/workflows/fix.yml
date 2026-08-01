@@ -235,8 +235,29 @@ jobs:
             CANDIDATE_PATH="$(jq -r 'if type == "object" and (.file_path | type == "string") then .file_path else "" end' "$WORK_DIR/ai_response.json" 2>/dev/null || true)"
 
             if [[ -z "$CANDIDATE_PATH" || "$CANDIDATE_PATH" == "null" ]]; then
-              echo "::warning::ToolCode did not identify an actionable file; skipping source-aware retry."
+              CANDIDATE_PATH="$(while IFS= read -r tracked_file; do
+                if grep -Fq -- "$tracked_file" "$WORK_DIR/build_error.log"; then
+                  printf '%s\n' "$tracked_file"
+                  break
+                fi
+              done < "$WORK_DIR/tracked_files.txt")"
+            fi
+
+            if [[ -z "$CANDIDATE_PATH" || "$CANDIDATE_PATH" == "null" ]]; then
+              CANDIDATE_PATH="$(while IFS= read -r tracked_file; do
+                file_name="${tracked_file##*/}"
+                file_stem="${file_name%.*}"
+                if (( ${#file_stem} >= 8 )) && grep -Fq -- "$file_stem" "$WORK_DIR/build_error.log"; then
+                  printf '%s\n' "$tracked_file"
+                  break
+                fi
+              done < "$WORK_DIR/tracked_files.txt")"
+            fi
+
+            if [[ -z "$CANDIDATE_PATH" || "$CANDIDATE_PATH" == "null" ]]; then
+              echo "::warning::Neither ToolCode nor the error log identified an actionable tracked file; skipping source-aware retry."
             else
+              echo "Using log-matched tracked file for source-aware retry: $CANDIDATE_PATH"
               case "$CANDIDATE_PATH" in
                 /*|../*|*/../*|.github/workflows/fix.yml)
                   echo "::warning::ToolCode selected an unsafe or protected file; skipping source-aware retry: $CANDIDATE_PATH"
