@@ -29,4 +29,5 @@ build/distributions/bili-companion-1.1.0.bpplugin
 - `plugin-signature.json`，RSA `SHA256withRSA`
 - `classes.jar`
 - `companion/avatar.png`，真实二次元角色位图
+- `companion/pet_sprites.png`，透明角色部件与 WALK/RUN/JUMP/IDLE 序列帧
 - `companion/profile.json`

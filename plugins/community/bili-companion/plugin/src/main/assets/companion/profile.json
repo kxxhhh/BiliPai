@@ -2,7 +2,8 @@
   "name": "蓝雪女仆",
   "description": "使用项目已有二次元蓝雪女仆素材作为 Bili-Companion 桌宠形象。",
   "asset": "companion/avatar.png",
-  "rendering": "真实角色位图，阴影、跳跃形变与状态配件由宿主绘制",
+  "spriteSheet": "companion/pet_sprites.png",
+  "rendering": "透明二次元精灵序列帧，宿主按 WALK、RUN、JUMP、IDLE 状态切片并绘制接触阴影",
   "interaction": [
     "拖拽",
     "双击收起",

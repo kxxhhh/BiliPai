@@ -9,6 +9,8 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.os.Handler
+import android.os.Looper
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -30,6 +32,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sign
 import kotlin.math.sin
 import kotlin.random.Random
@@ -131,14 +134,24 @@ internal class BiliCompanionOverlayView(
 ) : View(context) {
     private val accessibilityManager = context.getSystemService(AccessibilityManager::class.java)
     private val boundarySensor = CompanionBoundarySensor(context.resources.displayMetrics.density)
-    private val bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+    private val spritePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bubbleRect = RectF()
-    private val characterBitmap: Bitmap = BitmapFactory.decodeResource(
-        resources,
-        R.mipmap.ic_launcher_blue_snow_maid_front_foreground
-    )
+    private val spriteBitmap: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.pet_sprites)
+    private val spriteHandler = Handler(Looper.getMainLooper())
+    private var currentFrame = 0
+    private val totalFrames = 6
+    private val frameInterval = 100L
+    private val updateFrameRunnable = object : Runnable {
+        override fun run() {
+            if (!isTalkBackActive()) {
+                currentFrame = (currentFrame + 1) % totalFrames
+                invalidate()
+            }
+            spriteHandler.postDelayed(this, frameInterval)
+        }
+    }
     private var rootForBoundary: View? = null
     private var layoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
     private var scrollListener: ViewTreeObserver.OnScrollChangedListener? = null
@@ -219,6 +232,18 @@ internal class BiliCompanionOverlayView(
         setLayerType(LAYER_TYPE_SOFTWARE, null)
         setWillNotDraw(false)
         updateAccessibilityDescription()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        spriteHandler.removeCallbacks(updateFrameRunnable)
+        spriteHandler.post(updateFrameRunnable)
+    }
+
+    override fun onDetachedFromWindow() {
+        spriteHandler.removeCallbacks(updateFrameRunnable)
+        unbindBoundaryRoot()
+        super.onDetachedFromWindow()
     }
 
     fun setCompanionEnabled(value: Boolean) {
@@ -478,28 +503,103 @@ internal class BiliCompanionOverlayView(
             drawSpeechBubble(canvas, left, top, size)
         }
 
-        val bob = if (airborne) 0f else sin(walkPhase) * size * 0.025f
-        val stretch = (abs(velocityY) / metrics.jumpImpulse).coerceIn(0f, 1f)
-        val squashY = (1f - stretch * 0.06f + landingImpact * 0.1f).coerceIn(0.9f, 1.08f)
-        val squashX = (1.04f - (squashY - 1f) * 0.55f).coerceIn(0.94f, 1.1f)
-
-        canvas.save()
-        canvas.translate(centerX, top + size / 2f + bob)
-        canvas.scale(if (velocityX < -metrics.density) -1f else 1f, 1f)
-        canvas.scale(squashX, squashY)
-        canvas.translate(-centerX, -(top + size / 2f))
-        canvas.drawBitmap(characterBitmap, null, RectF(left, top, left + size, top + size), bitmapPaint)
-        canvas.restore()
-
-        when (state.mood) {
-            CompanionMood.PARTY -> drawPartyDetails(canvas, left, top, size)
-            CompanionMood.STUDY -> drawStudyDetails(canvas, left, top, size)
-            CompanionMood.BORED -> drawSleepMarks(canvas, left, top, size)
-        }
-        if (state.isEating) drawEatingSpark(canvas, left, top, size)
+        drawSprite(canvas, size, top, resolveSpriteMotion())
         if (boundarySensor.loadingDetected && !state.isCompact) drawBroom(canvas, left, top, size)
         if (!state.isCompact) drawFullness(canvas, left, top, size)
     }
+
+    private enum class SpriteMotion {
+        IDLE,
+        WALK,
+        RUN,
+        JUMP
+    }
+
+    private fun resolveSpriteMotion(): SpriteMotion = when {
+        airborne -> SpriteMotion.JUMP
+        boundarySensor.loadingDetected -> SpriteMotion.RUN
+        abs(velocityX) > metrics.density * 8f -> SpriteMotion.WALK
+        else -> SpriteMotion.IDLE
+    }
+
+    private fun drawSprite(canvas: Canvas, size: Float, top: Float, motion: SpriteMotion) {
+        val source = spriteSourceRect(motion, currentFrame)
+        val destinationHeight = size
+        val destinationWidth = destinationHeight * source.width().toFloat() / source.height().coerceAtLeast(1)
+        val bob = if (motion == SpriteMotion.IDLE) sin(walkPhase * 0.35f) * size * 0.012f else 0f
+        val stretch = (abs(velocityY) / metrics.jumpImpulse).coerceIn(0f, 1f)
+        val squashY = (1f - stretch * 0.06f + landingImpact * 0.1f).coerceIn(0.9f, 1.08f)
+        val squashX = (1.04f - (squashY - 1f) * 0.55f).coerceIn(0.94f, 1.1f)
+        val destination = RectF(
+            centerX - destinationWidth / 2f,
+            top + bob,
+            centerX + destinationWidth / 2f,
+            top + destinationHeight + bob
+        )
+
+        canvas.save()
+        canvas.scale(
+            if (velocityX < -metrics.density) -1f else 1f,
+            1f,
+            destination.centerX(),
+            destination.centerY()
+        )
+        canvas.scale(squashX, squashY, destination.centerX(), destination.bottom)
+        canvas.drawBitmap(spriteBitmap, source, destination, spritePaint)
+        canvas.restore()
+    }
+
+    private fun spriteSourceRect(motion: SpriteMotion, frame: Int): Rect {
+        val bitmapWidth = spriteBitmap.width.toFloat()
+        val bitmapHeight = spriteBitmap.height.toFloat()
+        // animationrole.txt defines the sheet's 18x5 grid. The exported sheet also
+        // contains labels and gutters, so these calibrated strips preserve full frames.
+        val unitWidth = bitmapWidth / 18f
+        val unitHeight = bitmapHeight / 5f
+        val sequenceWidth = bitmapWidth / 14f
+        val sequenceHeight = unitHeight * 1.12f
+        val safeFrame = frame % totalFrames
+
+        val (left, top, width, height) = when (motion) {
+            SpriteMotion.WALK -> SpriteSlice(
+                left = unitWidth * 0.4f + safeFrame * sequenceWidth,
+                top = bitmapHeight * 0.49f,
+                width = sequenceWidth,
+                height = sequenceHeight
+            )
+            SpriteMotion.RUN -> SpriteSlice(
+                left = bitmapWidth * 0.55f + safeFrame * sequenceWidth,
+                top = bitmapHeight * 0.49f,
+                width = sequenceWidth,
+                height = sequenceHeight
+            )
+            SpriteMotion.IDLE -> SpriteSlice(
+                left = unitWidth * 0.25f + (safeFrame % 3) * sequenceWidth,
+                top = bitmapHeight * 0.75f,
+                width = sequenceWidth,
+                height = unitHeight * 1.12f
+            )
+            SpriteMotion.JUMP -> SpriteSlice(
+                left = bitmapWidth * 0.265f + (safeFrame % 3) * bitmapWidth * 0.095f,
+                top = bitmapHeight * 0.735f,
+                width = bitmapWidth * 0.095f,
+                height = unitHeight * 1.12f
+            )
+        }
+
+        val sourceLeft = left.roundToInt().coerceIn(0, spriteBitmap.width - 1)
+        val sourceTop = top.roundToInt().coerceIn(0, spriteBitmap.height - 1)
+        val sourceRight = (left + width).roundToInt().coerceIn(sourceLeft + 1, spriteBitmap.width)
+        val sourceBottom = (top + height).roundToInt().coerceIn(sourceTop + 1, spriteBitmap.height)
+        return Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
+    }
+
+    private data class SpriteSlice(
+        val left: Float,
+        val top: Float,
+        val width: Float,
+        val height: Float
+    )
 
     private fun drawContactShadow(canvas: Canvas, size: Float, floor: Float, top: Float) {
         val distance = (floor - top).coerceAtLeast(0f)
@@ -512,7 +612,7 @@ internal class BiliCompanionOverlayView(
             2f * metrics.density,
             0x55000000
         )
-        val shadowWidth = size * (0.42f - (distance / size).coerceIn(0f, 0.6f) * 0.12f)
+        val shadowWidth = size * (0.24f - (distance / size).coerceIn(0f, 0.6f) * 0.07f)
         canvas.drawOval(
             centerX - shadowWidth,
             floor + size * 0.88f,
@@ -578,53 +678,6 @@ internal class BiliCompanionOverlayView(
         canvas.drawRoundRect(left + size * 0.1f, y, left + size * 0.9f, y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
         paint.color = 0xFFFFC857.toInt()
         canvas.drawRoundRect(left + size * 0.1f, y, left + size * (0.1f + 0.8f * state.fullness), y + 4f * metrics.density, 3f * metrics.density, 3f * metrics.density, paint)
-    }
-
-    private fun drawPartyDetails(canvas: Canvas, left: Float, top: Float, size: Float) {
-        paint.style = Paint.Style.FILL
-        paint.color = 0xE52D3540.toInt()
-        canvas.drawRoundRect(left + size * 0.22f, top + size * 0.4f, left + size * 0.47f, top + size * 0.5f, size * 0.04f, size * 0.04f, paint)
-        canvas.drawRoundRect(left + size * 0.53f, top + size * 0.4f, left + size * 0.78f, top + size * 0.5f, size * 0.04f, size * 0.04f, paint)
-        paint.strokeWidth = max(metrics.density, size * 0.025f)
-        canvas.drawLine(left + size * 0.47f, top + size * 0.44f, left + size * 0.53f, top + size * 0.44f, paint)
-        paint.color = 0xFFFFC857.toInt()
-        canvas.drawCircle(left + size * 0.08f, top + size * 0.18f, size * 0.035f, paint)
-        canvas.drawCircle(left + size * 0.92f, top + size * 0.25f, size * 0.035f, paint)
-        paint.color = 0xFFE45C78.toInt()
-        canvas.drawCircle(left + size * 0.14f, top + size * 0.72f, size * 0.025f, paint)
-        canvas.drawCircle(left + size * 0.88f, top + size * 0.68f, size * 0.025f, paint)
-    }
-
-    private fun drawStudyDetails(canvas: Canvas, left: Float, top: Float, size: Float) {
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = max(metrics.density, size * 0.018f)
-        paint.color = 0xFF5B6470.toInt()
-        canvas.drawOval(left + size * 0.2f, top + size * 0.39f, left + size * 0.47f, top + size * 0.52f, paint)
-        canvas.drawOval(left + size * 0.53f, top + size * 0.39f, left + size * 0.8f, top + size * 0.52f, paint)
-        canvas.drawLine(left + size * 0.47f, top + size * 0.44f, left + size * 0.53f, top + size * 0.44f, paint)
-        paint.style = Paint.Style.FILL
-        paint.color = 0xFF4D8C8A.toInt()
-        paint.textSize = size * 0.16f
-        paint.typeface = Typeface.DEFAULT_BOLD
-        canvas.drawText("记", left + size * 0.8f, top + size * 0.18f, paint)
-    }
-
-    private fun drawSleepMarks(canvas: Canvas, left: Float, top: Float, size: Float) {
-        paint.style = Paint.Style.FILL
-        paint.color = 0xFF587080.toInt()
-        paint.typeface = Typeface.DEFAULT_BOLD
-        paint.textSize = size * 0.15f
-        canvas.drawText("呼", left + size * 0.78f, top + size * 0.16f, paint)
-        paint.textSize = size * 0.22f
-        canvas.drawText("呼", left + size * 0.92f, top - size * 0.02f, paint)
-    }
-
-    private fun drawEatingSpark(canvas: Canvas, left: Float, top: Float, size: Float) {
-        paint.style = Paint.Style.FILL
-        paint.color = 0xFFFFC857.toInt()
-        val pulse = 0.04f + (sin(walkPhase * 2f) + 1f) * 0.025f
-        canvas.drawCircle(left + size * 0.88f, top + size * 0.64f, size * pulse, paint)
-        canvas.drawCircle(left + size * 0.96f, top + size * 0.56f, size * pulse * 0.65f, paint)
     }
 
     private fun drawBroom(canvas: Canvas, left: Float, top: Float, size: Float) {

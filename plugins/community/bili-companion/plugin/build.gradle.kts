@@ -58,6 +58,8 @@ val prepareBpPlugin by tasks.registering {
         classesJar.copyTo(File(staging, "classes.jar"), overwrite = true)
         rootProject.file("plugin/src/main/assets/companion/avatar.png")
             .copyTo(File(staging, "companion/avatar.png"), overwrite = true)
+        rootProject.file("plugin/src/main/assets/companion/pet_sprites.png")
+            .copyTo(File(staging, "companion/pet_sprites.png"), overwrite = true)
         rootProject.file("plugin/src/main/assets/companion/profile.json")
             .copyTo(File(staging, "companion/profile.json"), overwrite = true)
 
