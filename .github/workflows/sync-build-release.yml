@@ -1,3 +1,122 @@
+name: Daily Upstream Sync, AI Heal & Release APK
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bili-pai-upstream-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/jay3-yy/BiliPai.git
+  UPSTREAM_BRANCH: main
+  AI_BASE_URL: https://toolcode.top/v1/chat/completions
+  AI_MODEL: gpt-5.6-luna
+  PROTECTED_PLUGIN_ROOT: app/src/main/java/com/android/purebilibili/feature/plugin/bilicompanion
+  PROTECTED_PLUGIN_TEST_ROOT: app/src/test/java/com/android/purebilibili/feature/plugin/bilicompanion
+  PROTECTED_HOST_FILE: app/src/main/java/com/android/purebilibili/feature/video/VideoActivity.kt
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission to Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch and merge upstream
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --prune upstream "$UPSTREAM_BRANCH"
+
+          merge_log="$RUNNER_TEMP/upstream-merge.log"
+          if git merge --no-edit --no-ff "upstream/$UPSTREAM_BRANCH" 2>&1 | tee "$merge_log"; then
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "sync_failed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "上游合并出现冲突，按保护策略自动处理。"
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          if ((${#conflicts[@]} == 0)); then
+            git merge --abort || true
+            echo "sync_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          for path in "${conflicts[@]}"; do
+            case "$path" in
+              "$PROTECTED_PLUGIN_ROOT"/*|"$PROTECTED_PLUGIN_TEST_ROOT"/*|"$PROTECTED_HOST_FILE")
+                echo "保留本地 Bili-Companion 实现：$path"
+                git checkout --ours -- "$path"
+                ;;
+              *)
+                echo "采用上游冲突版本：$path"
+                git checkout --theirs -- "$path"
+                ;;
+            esac
+          done
+
+          git add -u
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            git merge --abort || true
+            echo "sync_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          git commit -m "chore(sync): merge upstream with protected Bili-Companion"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+          echo "sync_failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --no-configuration-cache --console=plain \
+            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+      - name: Verify AI secret before self-healing
+        if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure')
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY secret is required when sync or build fails."
+            exit 1
+          fi
+
       - name: AI diagnose and apply a validated patch
         id: ai_heal
         if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure')
@@ -44,7 +163,6 @@
               if path.is_file():
                   source_context.append("\n--- " + relative + " ---\n" + read_text(relative, 9000))
 
-          # 避开大段 f-string 多行中文可能引发的语法解析隐患，改用安全拼接
           prompt = (
               "你是 BiliPai Android 项目的自动修复工程师。\n"
               "请根据下面的同步/编译错误和仓库上下文，修复当前工作树中的真实问题。\n"
@@ -127,3 +245,71 @@
               sys.exit(1)
           print("AI 补丁已通过 git apply 校验并应用。")
           PY
+
+      - name: Rebuild after AI self-healing
+        id: retry_build
+        if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure') && steps.ai_heal.outcome == 'success'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --no-configuration-cache --console=plain \
+            2>&1 | tee "$RUNNER_TEMP/gradle-retry-build.log"
+
+      - name: Commit and push sync or AI fixes
+        id: publish_source
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          git reset --quiet -- app/build 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(ci): sync upstream and heal build"
+          fi
+          git push origin HEAD:main
+          echo "release_target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Release assets
+        id: release_assets
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/bilipai-release-assets"
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+          mapfile -t apks < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print)
+          if ((${#apks[@]} == 0)); then
+            echo "没有找到 assembleDebug 生成的 APK。"
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            cp "$apk" "$release_dir/"
+          done
+          (cd "$release_dir" && sha256sum *.apk > SHA256SUMS.txt)
+          tag_name="v$(date -u +'%Y.%m.%d-%H%M')"
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "release_dir=$release_dir" >> "$GITHUB_OUTPUT"
+          cat "$release_dir/SHA256SUMS.txt"
+
+      - name: Publish APK to GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_assets.outputs.tag_name }}
+          target_commitish: ${{ steps.publish_source.outputs.release_target }}
+          name: BiliPai automated debug build ${{ steps.release_assets.outputs.tag_name }}
+          body: |
+            本 Release 由每日上游同步工作流自动生成。
+
+            - 上游仓库：jay3-yy/BiliPai
+            - 构建任务：`./gradlew assembleDebug`
+            - AI 自愈：仅在同步或编译失败时调用 ToolCode OpenAI 兼容接口，并且只接受通过 `git apply` 的 unified diff。
+            - 校验和：见 `SHA256SUMS.txt`
+          files: |
+            ${{ steps.release_assets.outputs.release_dir }}/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
