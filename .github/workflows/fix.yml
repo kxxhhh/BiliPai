@@ -189,6 +189,79 @@ jobs:
 
           # The first choices element is the standard chat-completions response shape.
           jq -r '.choices[0].message.content' "$WORK_DIR/ai_http_response.json" > "$WORK_DIR/ai_response.json"
+
+          if ! jq -e 'type == "object" and (.file_path | type == "string" and length > 0 and . != "null") and (.fixed_content | type == "string" and length > 0 and . != "null")' "$WORK_DIR/ai_response.json" >/dev/null; then
+            CANDIDATE_PATH="$(jq -r 'if type == "object" and (.file_path | type == "string") then .file_path else "" end' "$WORK_DIR/ai_response.json" 2>/dev/null || true)"
+
+            if [[ -z "$CANDIDATE_PATH" || "$CANDIDATE_PATH" == "null" ]]; then
+              echo "::warning::ToolCode did not identify an actionable file; skipping source-aware retry."
+            else
+              case "$CANDIDATE_PATH" in
+                /*|../*|*/../*|.github/workflows/fix.yml)
+                  echo "::warning::ToolCode selected an unsafe or protected file; skipping source-aware retry: $CANDIDATE_PATH"
+                  ;;
+                *)
+                  if ! git ls-files --error-unmatch -- "$CANDIDATE_PATH" >/dev/null 2>&1; then
+                    echo "::warning::ToolCode selected an untracked file; skipping source-aware retry: $CANDIDATE_PATH"
+                  else
+                    jq -n \
+                      --arg model "gpt-5.6-luna" \
+                      --arg file_path "$CANDIDATE_PATH" \
+                      --rawfile error_log "$WORK_DIR/build_error.log" \
+                      --rawfile source_content "$CANDIDATE_PATH" \
+                      '{
+                        model: $model,
+                        messages: [{
+                          role: "user",
+                          content: ("The CI workflow failed. Fix the tracked file named in file_path. Preserve unrelated content and return the complete corrected file.\n--- file_path ---\n" + $file_path + "\n--- current source ---\n" + $source_content + "\n--- error log ---\n" + $error_log + "\n--- instructions ---\nReturn only a JSON object with this exact shape: {\"file_path\":\"" + $file_path + "\",\"fixed_content\":\"complete corrected file content\"}. Do not return null or markdown.")
+                        }],
+                        response_format: {type: "json_object"}
+                      }' > "$WORK_DIR/source_request.json"
+
+                    echo "Calling ToolCode AI with the selected source file..."
+                    set +e
+                    RETRY_HTTP_CODE="$(curl \
+                      --location \
+                      --silent \
+                      --show-error \
+                      --fail-with-body \
+                      --connect-timeout 20 \
+                      --max-time 180 \
+                      --request POST "https://toolcode.top/v1/chat/completions" \
+                      --header "Authorization: Bearer $TOOLCODE_API_KEY" \
+                      --header "Content-Type: application/json" \
+                      --data-binary "@$WORK_DIR/source_request.json" \
+                      --output "$WORK_DIR/ai_source_http_response.json" \
+                      --write-out '%{http_code}')"
+                    RETRY_CURL_EXIT=$?
+                    set -e
+
+                    echo "ToolCode source-aware HTTP status: ${RETRY_HTTP_CODE:-unknown}"
+                    if [ "$RETRY_CURL_EXIT" -ne 0 ]; then
+                      echo "::error::Source-aware ToolCode request failed with curl exit code $RETRY_CURL_EXIT."
+                      cat "$WORK_DIR/ai_source_http_response.json" >&2 || true
+                      exit "$RETRY_CURL_EXIT"
+                    fi
+
+                    if ! jq -e . "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
+                      echo "::error::Source-aware ToolCode returned invalid JSON."
+                      cat "$WORK_DIR/ai_source_http_response.json"
+                      exit 1
+                    fi
+
+                    if ! jq -e '.choices[0].message.content | type == "string"' "$WORK_DIR/ai_source_http_response.json" >/dev/null; then
+                      echo "::error::Source-aware ToolCode response does not contain choices[0].message.content."
+                      cat "$WORK_DIR/ai_source_http_response.json"
+                      exit 1
+                    fi
+
+                    jq -r '.choices[0].message.content' "$WORK_DIR/ai_source_http_response.json" > "$WORK_DIR/ai_response.json"
+                  fi
+                  ;;
+              esac
+            fi
+          fi
+
           echo "--- ToolCode response ---"
           cat "$WORK_DIR/ai_response.json"
 
