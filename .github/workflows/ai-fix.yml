@@ -1,0 +1,37 @@
+name: AI Auto-Fix Build Errors
+
+on:
+  workflow_run:
+    workflows: ["Build and Test"] # 监听你原本的打包工作流名字
+    types:
+      - completed
+
+jobs:
+  ai-fix:
+    runs-on: ubuntu-latest
+    # 只有当原本的构建失败时才触发
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download build failure logs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const runs = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.event.workflow_run.id,
+            });
+            // 获取对应的错误日志逻辑...（或直接通过 CLI 重新跑一遍并抓取错误日志）
+
+      - name: Run AI Fixer Agent
+        uses: casibase/ai-fix-action@main # 或其他成熟的 AI Fix 社区 Action
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          openai_base_url: "https://toolcode.top/v1"
+          model: "gpt-5.6-luna"
