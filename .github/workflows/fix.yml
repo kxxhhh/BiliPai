@@ -50,8 +50,8 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "Manual run requested; analyzing run $RUN_ID."
             echo "should_analyze=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$TRIGGER_CONCLUSION" == "failure" ]]; then
-            echo "The triggering workflow failed; starting analysis."
+          elif [[ "$TRIGGER_CONCLUSION" =~ ^(failure|cancelled|timed_out|startup_failure|action_required|stale)$ ]]; then
+            echo "The triggering workflow ended with '$TRIGGER_CONCLUSION'; starting analysis."
             echo "should_analyze=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::Skipping analysis because the triggering workflow conclusion is '${TRIGGER_CONCLUSION:-unknown}'."
