@@ -52,7 +52,6 @@ jobs:
 
       - name: Fetch and merge upstream
         id: upstream
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -63,6 +62,7 @@ jobs:
           merge_log="$RUNNER_TEMP/upstream-merge.log"
           if git merge --no-edit --no-ff "upstream/$UPSTREAM_BRANCH" 2>&1 | tee "$merge_log"; then
             echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "sync_failed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -70,6 +70,7 @@ jobs:
           mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
           if ((${#conflicts[@]} == 0)); then
             git merge --abort || true
+            echo "sync_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
@@ -89,12 +90,241 @@ jobs:
           git add -u
           if git diff --name-only --diff-filter=U | grep -q .; then
             git merge --abort || true
+            echo "sync_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
           git commit -m "chore(sync): merge upstream with protected Bili-Companion"
           echo "synced=true" >> "$GITHUB_OUTPUT"
+          echo "sync_failed=false" >> "$GITHUB_OUTPUT"
 
+      - name: Build debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --no-configuration-cache --console=plain \
+            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+      - name: Verify AI secret before self-healing
+        if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure')
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY secret is required when sync or build fails."
+            exit 1
+          fi
+
+      - name: AI diagnose and apply a validated patch
+        id: ai_heal
+        if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure')
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AI_BASE_URL: ${{ env.AI_BASE_URL }}
+          AI_MODEL: ${{ env.AI_MODEL }}
+          BUILD_LOG: ${{ runner.temp }}/gradle-build.log
+          SYNC_LOG: ${{ runner.temp }}/upstream-merge.log
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          def read_text(path, limit=16000):
+              file = Path(path)
+              if not file.exists():
+                  return ""
+              value = file.read_text(encoding="utf-8", errors="replace")
+              return value[-limit:]
+
+          def run(*args):
+              return subprocess.run(args, text=True, capture_output=True, check=False).stdout
+
+          build_log = read_text(os.environ["BUILD_LOG"])
+          sync_log = read_text(os.environ["SYNC_LOG"])
+          status = run("git", "status", "--short")
+          # 扩大 diff 检索范围，不限于 app 目录
+          diff = run("git", "diff", "--no-ext-diff")[-20000:]
+
+          # 优化正则，允许匹配任意模块路径及根目录配置文件
+          candidate_paths = set(re.findall(
+              r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:kt|kts|java|xml|gradle|properties)",
+              build_log + "\n" + sync_log,
+          ))
+          source_context = []
+          for relative in sorted(candidate_paths)[:10]:
+              path = Path(relative)
+              if path.is_file():
+                  source_context.append(f"\n--- {relative} ---\n{read_text(relative, 9000)}")
+
+          prompt = f"""你是 BiliPai Android 项目的自动修复工程师。
+请根据下面的同步/编译错误和仓库上下文，修复当前工作树中的真实问题。
+必须遵守：
+1. 保留 Bili-Companion 的功能、网络权限、无障碍行为和触摸穿透；不要删除插件。
+2. 不要加入新的依赖，不要修改签名或提交 APK 文件。
+3. 只输出一个可被 `git apply` 应用的标准 unified diff，必须以 `diff --git` 或 `--- ` 开始。
+4. 如果无法确定修复，请只输出 NO_PATCH。
+
+同步日志：
+{sync_log}
+
+编译日志：
+{build_log}
+
+Git 状态：
+{status}
+
+当前差异：
+{diff}
+
+相关源码：
+{''.join(source_context)}
+"""
+
+          endpoint = os.environ["AI_BASE_URL"].rstrip("/") + "/chat/completions"
+          request = urllib.request.Request(
+              endpoint,
+              data=json.dumps({
+                  "model": os.environ["AI_MODEL"],
+                  "temperature": 0,
+                  "messages": [
+                      {"role": "system", "content": "只返回可以直接应用的 unified diff，不要 Markdown 说明。"},
+                      {"role": "user", "content": prompt},
+                  ],
+              }).encode("utf-8"),
+              headers={
+                  "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  payload = json.loads(response.read().decode("utf-8"))
+          except Exception as error:
+              print(f"AI 请求失败：{error}", file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              content = payload["choices"][0]["message"]["content"]
+              if isinstance(content, list):
+                  content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+          except (KeyError, IndexError, TypeError) as error:
+              print(f"AI 返回格式无法识别：{error}", file=sys.stderr)
+              sys.exit(1)
+
+          if content.strip() == "NO_PATCH":
+              print("AI 判断当前错误无法自动修复。", file=sys.stderr)
+              sys.exit(1)
+
+          fenced = re.search(r"```(?:diff|patch)?\s*\n?(.*?)```", content, re.S | re.I)
+          patch = fenced.group(1).strip() if fenced else content.strip()
+          if not (patch.startswith("diff --git") or patch.startswith("--- ")):
+              print("AI 未返回标准 unified diff。", file=sys.stderr)
+              sys.exit(1)
+
+          patch_path = Path(os.environ["RUNNER_TEMP"]) / "ai-fix.patch"
+          patch_path.write_text(patch + "\n", encoding="utf-8")
+          
+          # 增加 --ignore-space-change 与 --ignore-whitespace 提高补丁容错率
+          check = subprocess.run(
+              ["git", "apply", "--check", "--ignore-space-change", "--ignore-whitespace", str(patch_path)],
+              text=True,
+              capture_output=True,
+              check=False,
+          )
+          if check.returncode != 0:
+              print("AI 补丁校验失败：", check.stderr, file=sys.stderr)
+              sys.exit(1)
+
+          apply = subprocess.run(
+              ["git", "apply", "--ignore-space-change", "--ignore-whitespace", str(patch_path)],
+              text=True,
+              capture_output=True,
+              check=False,
+          )
+          if apply.returncode != 0:
+              print("AI 补丁应用失败：", apply.stderr, file=sys.stderr)
+              sys.exit(1)
+          print("AI 补丁已通过 git apply 校验并应用。")
+          PY
+
+      - name: Rebuild after AI self-healing
+        id: retry_build
+        if: always() && (steps.upstream.outputs.sync_failed == 'true' || steps.build.outcome == 'failure') && steps.ai_heal.outcome == 'success'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --no-configuration-cache --console=plain \
+            2>&1 | tee "$RUNNER_TEMP/gradle-retry-build.log"
+
+      - name: Commit and push sync or AI fixes
+        id: publish_source
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          git reset --quiet -- app/build 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(ci): sync upstream and heal build"
+          fi
+          git push origin HEAD:main
+          echo "release_target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Release assets
+        id: release_assets
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/bilipai-release-assets"
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+          mapfile -t apks < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print)
+          if ((${#apks[@]} == 0)); then
+            echo "没有找到 assembleDebug 生成的 APK。"
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            cp "$apk" "$release_dir/"
+          done
+          (cd "$release_dir" && sha256sum *.apk > SHA256SUMS.txt)
+          tag_name="v$(date -u +'%Y.%m.%d-%H%M')"
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "release_dir=$release_dir" >> "$GITHUB_OUTPUT"
+          cat "$release_dir/SHA256SUMS.txt"
+
+      - name: Publish APK to GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_assets.outputs.tag_name }}
+          target_commitish: ${{ steps.publish_source.outputs.release_target }}
+          name: BiliPai automated debug build ${{ steps.release_assets.outputs.tag_name }}
+          body: |
+            本 Release 由每日上游同步工作流自动生成。
+
+            - 上游仓库：jay3-yy/BiliPai
+            - 构建任务：`./gradlew assembleDebug`
+            - AI 自愈：仅在同步或编译失败时调用 ToolCode OpenAI 兼容接口，并且只接受通过 `git apply` 的 unified diff。
+            - 校验和：见 `SHA256SUMS.txt`
+          files: |
+            ${{ steps.release_assets.outputs.release_dir }}/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build debug APK
         id: build
         continue-on-error: true
